@@ -148,17 +148,6 @@ class TestActivityLedger:
 
         _run(run())
 
-    def test_summary_is_silent_without_activity(self) -> None:
-        """No activity, no summary."""
-
-        async def run() -> None:
-            cam = _camera()
-            with patch.object(camera_module.LOGGER, "info") as info:
-                cam._log_activity_summary()
-            info.assert_not_called()
-
-        _run(run())
-
     def test_summary_reports_counters_and_printer_state(self) -> None:
         """The summary lines up our actions against the printer's view."""
 
@@ -270,5 +259,79 @@ class TestPortProbeRearm:
                 cam._last_port_probe -= camera_module.PORT_PROBE_INTERVAL + 1
                 await cam._probe_camera_ports(STREAM_URL)
                 assert warn.call_count == 2
+
+        _run(run())
+
+
+class TestPerGrabSummary:
+    """One INFO line per snapshot, readable without debug logging."""
+
+    def test_successful_grab_logs_result_and_size(self) -> None:
+        """A good grab reports ok, its size and a sequence number."""
+
+        async def run() -> None:
+            cam = _camera(passive=True)
+            frame = b"\xff\xd8payload\xff\xd9"
+            with (
+                patch.object(cam, "_grab_frame", AsyncMock(return_value=frame)),
+                patch.object(camera_module.LOGGER, "info") as info,
+            ):
+                await cam.async_camera_image()
+            line = next(c for c in info.call_args_list if "grab #%d" in c[0][0])
+            assert line[0][1] == 1  # sequence
+            assert line[0][3] == "ok"
+            assert line[0][4] == len(frame)
+            cam._cancel_pending_disable()
+
+        _run(run())
+
+    def test_failed_grab_logs_failed(self) -> None:
+        """A grab that returns nothing is recorded as failed, not dropped."""
+
+        async def run() -> None:
+            cam = _camera(passive=True)
+            with (
+                patch.object(cam, "_grab_frame", AsyncMock(return_value=None)),
+                patch.object(
+                    camera_module.MjpegCamera,
+                    "async_camera_image",
+                    AsyncMock(return_value=None),
+                ),
+                patch.object(camera_module.LOGGER, "info") as info,
+            ):
+                await cam.async_camera_image()
+            line = next(c for c in info.call_args_list if "grab #%d" in c[0][0])
+            assert line[0][3] == "failed"
+            cam._cancel_pending_disable()
+
+        _run(run())
+
+    def test_sequence_increments_across_grabs(self) -> None:
+        """Sequence numbers let interleaved lines be put back in order."""
+
+        async def run() -> None:
+            cam = _camera(passive=True)
+            with (
+                patch.object(
+                    cam, "_grab_frame", AsyncMock(return_value=b"\xff\xd8\xff\xd9")
+                ),
+                patch.object(camera_module.LOGGER, "info") as info,
+            ):
+                await cam.async_camera_image()
+                await cam.async_camera_image()
+            seqs = [c[0][1] for c in info.call_args_list if "grab #%d" in c[0][0]]
+            assert seqs == [1, 2]
+            cam._cancel_pending_disable()
+
+        _run(run())
+
+    def test_heartbeat_logs_even_with_no_activity(self) -> None:
+        """The summary is a heartbeat, so idle periods are still visible."""
+
+        async def run() -> None:
+            cam = _camera()
+            with patch.object(camera_module.LOGGER, "info") as info:
+                cam._log_activity_summary()
+            assert any("activity for" in c[0][0] for c in info.call_args_list)
 
         _run(run())
