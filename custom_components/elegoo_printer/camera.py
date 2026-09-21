@@ -340,10 +340,15 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         self._stats_last_logged = now
         num_connected, max_allowed = self._capacity_counters()
         attrs = self._printer_client.printer_data.attributes
+        # The MQTT session is a suspect for the camera dying, so its counters
+        # ride along on the same line rather than having to be correlated by
+        # timestamp across two log sources.
+        stats_fn = getattr(self._printer_client, "mqtt_session_stats", None)
+        mqtt_stats = stats_fn() if callable(stats_fn) else "n/a"
         LOGGER.info(
             LOG_MARKER + " activity for %s: %s | printer now reports "
             "%d/%d video slots in use, camera_status=%s, stream_enabled=%s, "
-            "passive=%s",
+            "passive=%s | mqtt: %s",
             self.entity_id,
             ", ".join(f"{k}={v}" for k, v in self._stats.items()),
             num_connected,
@@ -351,6 +356,7 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
             getattr(attrs, "camera_status", None),
             self._stream_enabled,
             self._cc2_passive,
+            mqtt_stats,
         )
 
     async def _release_stale_stream(self) -> bool:
