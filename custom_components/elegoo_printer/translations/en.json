@@ -19,10 +19,12 @@
         "data": {
           "ip_address": "Printer IP Address",
           "cc2_access_code": "Access Code (optional)",
-          "gcode_proxy_url": "GCode proxy URL (optional)"
+          "gcode_proxy_url": "GCode proxy URL (optional)",
+          "cc2_camera_passive": "Camera passive mode (never enable/disable video)"
         },
         "data_description": {
-          "gcode_proxy_url": "Base URL of the elegoo-printer-proxy (host, host:port, or http(s) URL. HTTP is used if you omit the scheme). Leave blank to disable."
+          "gcode_proxy_url": "Base URL of the elegoo-printer-proxy (host, host:port, or http(s) URL. HTTP is used if you omit the scheme). Leave blank to disable.",
+          "cc2_camera_passive": "Read the chamber camera stream without sending video enable/disable commands to the printer. Use this if the camera stops responding after Home Assistant has been running for a while."
         }
       },
       "mqtt_options": {
@@ -98,7 +100,11 @@
         "title": "Centauri Carbon 2 Options",
         "description": "Configure your Centauri Carbon 2 printer. If your printer has access code authentication enabled, enter your access code below. Leave blank if no access code is required.",
         "data": {
-          "cc2_access_code": "Access Code (optional)"
+          "cc2_access_code": "Access Code (optional)",
+          "cc2_camera_passive": "Camera passive mode (never enable/disable video)"
+        },
+        "data_description": {
+          "cc2_camera_passive": "Read the chamber camera stream without sending video enable/disable commands to the printer. Use this if the camera stops responding after Home Assistant has been running for a while."
         }
       },
       "cc2_auth_check": {

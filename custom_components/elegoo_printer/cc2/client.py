@@ -116,6 +116,11 @@ class ElegooCC2Client:
         self._gcode_proxy = gcode_proxy
         self.printer_data = PrinterData(printer=self.printer)
 
+        # Video diagnostics: the printer's own view of its camera, tracked so
+        # every change is logged rather than only sampled when a grab fails.
+        self._last_video_slot_count: int | None = None
+        self._last_camera_status: int | None = None
+
         # MQTT client state
         self.mqtt_client: aiomqtt.Client | None = None
         self._is_connected: bool = False
@@ -1212,11 +1217,71 @@ class ElegooCC2Client:
         try:
             # Map CC2 attributes to PrinterAttributes
             mapped_attrs = CC2StatusMapper.map_attributes(attrs_data)
+            self._log_camera_telemetry(mapped_attrs)
             self.printer_data.attributes = mapped_attrs
             if self.printer:
                 self.printer.sync_from_attributes(mapped_attrs)
         except Exception:
             self.logger.exception("Failed to map CC2 attributes")
+
+    def _log_camera_telemetry(self, attrs: Any) -> None:
+        """
+        Log every change the printer reports in its camera state.
+
+        Two signals matter for diagnosing a camera that stops answering
+        after a while:
+
+        - num_video_stream_connected climbing and never coming back down
+          means connection slots are leaking.
+        - camera_status dropping from 1 to 0 means the printer itself has
+          decided the camera is gone, which no client-side change can fix.
+
+        Both are logged whenever they change, so a normal debug session
+        produces a timeline instead of a single sample taken at failure.
+        """
+        num = getattr(attrs, "num_video_stream_connected", 0) or 0
+        max_allowed = getattr(attrs, "max_video_stream_allowed", 0) or 0
+        status = getattr(attrs, "camera_status", None)
+
+        previous_num = self._last_video_slot_count
+        self._last_video_slot_count = num
+        if previous_num is None:
+            self.logger.info(
+                "CC2 camera baseline: %d/%d video slots in use, camera_status=%s",
+                num,
+                max_allowed,
+                status,
+            )
+        elif num != previous_num:
+            if max_allowed and num >= max_allowed:
+                self.logger.warning(
+                    "CC2 video slots EXHAUSTED: %d -> %d of %d in use "
+                    "(camera_status=%s). Further camera connections will fail "
+                    "until slots are released.",
+                    previous_num,
+                    num,
+                    max_allowed,
+                    status,
+                )
+            else:
+                self.logger.info(
+                    "CC2 video slots: %d -> %d of %d in use (camera_status=%s)",
+                    previous_num,
+                    num,
+                    max_allowed,
+                    status,
+                )
+
+        previous_status = self._last_camera_status
+        self._last_camera_status = status
+        if previous_status is not None and status != previous_status:
+            self.logger.warning(
+                "CC2 camera_status changed: %s -> %s "
+                "(0=disconnected, 1=connected). A drop to 0 means the printer "
+                "itself has lost the camera.",
+                previous_status,
+                status,
+            )
 
     def _handle_video_response(self, video_data: dict[str, Any]) -> None:
         """Handle video stream response."""
