@@ -125,8 +125,9 @@ class TestCC2FrameFetch:
             cam = _cc2_camera(_make_client())
             session = _FakeSession([_FakeResponse(body=b"junk" + JPEG)])
             with _patch_session(session):
-                image = await cam._fetch_single_frame(STREAM_URL)
+                image, retryable = await cam._fetch_frame_once(STREAM_URL)
             assert image == JPEG
+            assert retryable is False
             assert session.calls == [STREAM_URL]
 
         _run(run())
@@ -141,8 +142,10 @@ class TestCC2FrameFetch:
                 _patch_session(session),
                 patch.object(camera_module.LOGGER, "warning") as warn,
             ):
-                image = await cam._fetch_single_frame(STREAM_URL)
+                image, retryable = await cam._fetch_frame_once(STREAM_URL)
             assert image is None
+            # A reply that arrived is never retried - it would cost a slot.
+            assert retryable is False
             assert warn.call_count == 1
             assert "HTTP %d" in warn.call_args[0][0]
 
@@ -158,46 +161,49 @@ class TestCC2FrameFetch:
                 _patch_session(session),
                 patch.object(camera_module.LOGGER, "warning") as warn,
             ):
-                image = await cam._fetch_single_frame(STREAM_URL)
+                image, retryable = await cam._fetch_frame_once(STREAM_URL)
             assert image is None
+            assert retryable is False
             assert "no JPEG frame" in warn.call_args[0][0]
 
         _run(run())
 
-    def test_connection_error_is_logged_with_type(self) -> None:
-        """A transport error names the exception type and message."""
+    def test_connection_error_is_retryable(self) -> None:
+        """A refused connection is the one case worth another attempt."""
 
         async def run() -> None:
             cam = _cc2_camera(_make_client())
             session = _FakeSession([OSError("connection refused")])
             with (
                 _patch_session(session),
-                patch.object(camera_module.LOGGER, "warning") as warn,
+                patch.object(camera_module.LOGGER, "debug") as debug,
             ):
-                image = await cam._fetch_single_frame(STREAM_URL)
+                image, retryable = await cam._fetch_frame_once(STREAM_URL)
             assert image is None
-            assert "connection refused" in str(warn.call_args)
+            assert retryable is True
+            assert "connection refused" in str(debug.call_args)
 
         _run(run())
 
 
-class TestStreamReadiness:
-    """_wait_for_stream_ready retries until the server answers."""
+class TestGrabRetry:
+    """_grab_frame retries only while the camera server refuses to answer."""
 
-    def test_ready_on_first_probe(self) -> None:
-        """A server that is already up needs one probe and no sleeping."""
+    def test_succeeds_on_first_connection(self) -> None:
+        """A camera that is already listening costs exactly one connection."""
 
         async def run() -> None:
             cam = _cc2_camera(_make_client())
-            session = _FakeSession([_FakeResponse(status=200)])
+            session = _FakeSession([_FakeResponse()])
             with _patch_session(session):
-                assert await cam._wait_for_stream_ready(STREAM_URL) is True
+                image = await cam._grab_frame(STREAM_URL, allow_retry=True)
+            assert image == JPEG
             assert len(session.calls) == 1
 
         _run(run())
 
-    def test_retries_until_server_accepts(self) -> None:
-        """Two refused connections then success — the grab still happens."""
+    def test_retries_until_camera_server_accepts(self) -> None:
+        """Two refused connections then a frame — the race is ridden out."""
 
         async def run() -> None:
             cam = _cc2_camera(_make_client())
@@ -205,31 +211,65 @@ class TestStreamReadiness:
                 [
                     OSError("connection refused"),
                     OSError("connection refused"),
-                    _FakeResponse(status=200),
+                    _FakeResponse(),
                 ]
             )
             with (
                 _patch_session(session),
                 patch.object(camera_module.asyncio, "sleep", AsyncMock()),
             ):
-                assert await cam._wait_for_stream_ready(STREAM_URL) is True
+                image = await cam._grab_frame(STREAM_URL, allow_retry=True)
+            assert image == JPEG
             assert len(session.calls) == 3
 
         _run(run())
 
-    def test_gives_up_and_warns_after_timeout(self) -> None:
-        """A server that never comes up is reported once at WARNING."""
+    def test_http_error_is_not_retried(self) -> None:
+        """A reply that arrived costs one slot and is never retried."""
 
         async def run() -> None:
             cam = _cc2_camera(_make_client())
-            session = _FakeSession([OSError("refused")] * 50)
+            session = _FakeSession([_FakeResponse(status=404)] * 5)
             with (
                 _patch_session(session),
                 patch.object(camera_module.asyncio, "sleep", AsyncMock()),
+            ):
+                image = await cam._grab_frame(STREAM_URL, allow_retry=True)
+            assert image is None
+            assert len(session.calls) == 1
+
+        _run(run())
+
+    def test_no_retry_when_not_allowed(self) -> None:
+        """An already-enabled stream makes exactly one attempt."""
+
+        async def run() -> None:
+            cam = _cc2_camera(_make_client())
+            session = _FakeSession([OSError("refused")] * 5)
+            with (
+                _patch_session(session),
+                patch.object(camera_module.asyncio, "sleep", AsyncMock()),
+            ):
+                image = await cam._grab_frame(STREAM_URL, allow_retry=False)
+            assert image is None
+            assert len(session.calls) == 1
+
+        _run(run())
+
+    def test_gives_up_and_warns_after_budget(self) -> None:
+        """A camera that never comes up is reported once at WARNING."""
+
+        async def run() -> None:
+            cam = _cc2_camera(_make_client())
+            session = _FakeSession([OSError("refused")] * 100)
+            with (
+                _patch_session(session),
+                patch.object(camera_module, "FRAME_RETRY_TIMEOUT", 0),
                 patch.object(camera_module.LOGGER, "warning") as warn,
             ):
-                assert await cam._wait_for_stream_ready(STREAM_URL) is False
-            assert "not ready" in warn.call_args[0][0]
+                image = await cam._grab_frame(STREAM_URL, allow_retry=True)
+            assert image is None
+            assert "never accepted a connection" in warn.call_args[0][0]
 
         _run(run())
 
@@ -308,13 +348,12 @@ class TestCC2CameraImage:
             session = _FakeSession([_FakeResponse()])
             with (
                 _patch_session(session),
-                patch.object(cam, "_wait_for_stream_ready", AsyncMock()) as ready,
+                patch.object(cam, "_grab_frame", AsyncMock(return_value=JPEG)) as grab,
             ):
                 image = await cam.async_camera_image()
             assert image == JPEG
-            ready.assert_not_called()
-            # Exactly one connection: the frame grab itself.
-            assert session.calls == [STREAM_URL]
+            # Reused stream: the grab is made without retrying.
+            grab.assert_awaited_once_with(STREAM_URL, allow_retry=False)
             cam._cancel_pending_disable()
 
         _run(run())
@@ -328,13 +367,12 @@ class TestCC2CameraImage:
             session = _FakeSession([_FakeResponse()])
             with (
                 _patch_session(session),
-                patch.object(
-                    cam, "_wait_for_stream_ready", AsyncMock(return_value=True)
-                ) as ready,
+                patch.object(cam, "_grab_frame", AsyncMock(return_value=JPEG)) as grab,
             ):
                 image = await cam.async_camera_image()
             assert image == JPEG
-            ready.assert_awaited_once_with(STREAM_URL)
+            # Freshly enabled: retries are allowed to ride out the race.
+            grab.assert_awaited_once_with(STREAM_URL, allow_retry=True)
             cam._cancel_pending_disable()
 
         _run(run())
@@ -377,15 +415,15 @@ class TestCC2CameraImage:
             client = _make_client()
             cam = _cc2_camera(client)
             order: list[str] = []
-            original = cam._fetch_single_frame
+            original = cam._fetch_frame_once
 
-            async def tracked(url: str) -> bytes | None:
+            async def tracked(url: str) -> tuple[bytes | None, bool]:
                 order.append("start")
                 await asyncio.sleep(0)
                 order.append("end")
                 return await original(url)
 
-            cam._fetch_single_frame = tracked
+            cam._fetch_frame_once = tracked
             session = _FakeSession([_FakeResponse(status=200), _FakeResponse()] * 2)
             with _patch_session(session):
                 await asyncio.gather(cam.async_camera_image(), cam.async_camera_image())
@@ -395,37 +433,126 @@ class TestCC2CameraImage:
 
         _run(run())
 
-    def test_endpoint_probe_runs_once_after_failure(self) -> None:
-        """The diagnostic probe fires on failure and only once per entity."""
+    def test_only_one_connection_per_successful_grab(self) -> None:
+        """
+        A snapshot spends exactly one camera connection.
+
+        The CC2 camera allows a single viewer, so a second connection for
+        a readiness probe would compete with the grab for the only slot.
+        """
 
         async def run() -> None:
             client = _make_client()
             cam = _cc2_camera(client)
-            session = _FakeSession([_FakeResponse(status=404)] * 40)
-            with (
-                _patch_session(session),
-                patch.object(camera_module.asyncio, "sleep", AsyncMock()),
-                patch.object(
-                    camera_module.MjpegCamera,
-                    "async_camera_image",
-                    AsyncMock(return_value=None),
-                ),
-                patch.object(camera_module.LOGGER, "warning") as warn,
-            ):
-                assert await cam.async_camera_image() is None
-                assert cam._endpoints_probed is True
-                probe_logs = [
-                    c for c in warn.call_args_list if "endpoint probe" in c[0][0]
-                ]
-                assert len(probe_logs) == 1
-                # A second failure must not re-probe.
-                cam._last_grab_failure_log = 0.0
-                await cam.async_camera_image()
-                probe_logs = [
-                    c for c in warn.call_args_list if "endpoint probe" in c[0][0]
-                ]
-                assert len(probe_logs) == 1
+            session = _FakeSession([_FakeResponse()])
+            with _patch_session(session):
+                image = await cam.async_camera_image()
+            assert image == JPEG
+            assert len(session.calls) == 1
             cam._cancel_pending_disable()
+
+        _run(run())
+
+
+class TestSlotPrevention:
+    """Never leave a video slot occupied."""
+
+    def test_startup_sends_unconditional_disable(self) -> None:
+        """
+        A slot leaked by a previous run is released when the entity is added.
+
+        _stream_enabled starts False, so the normal disable path would
+        never touch a stream the printer is still holding open.
+        """
+
+        async def run() -> None:
+            client = _make_client()
+            cam = _cc2_camera(client)
+            assert cam._stream_enabled is False
+            released = await cam._release_stale_stream()
+            assert released is True
+            client.set_printer_video_stream.assert_called_once_with(enable=False)
+
+        _run(run())
+
+    def test_startup_release_retried_while_disconnected(self) -> None:
+        """A printer that is not reachable yet is retried by the watchdog."""
+
+        async def run() -> None:
+            client = _make_client()
+            client.is_connected = False
+            cam = _cc2_camera(client)
+            assert await cam._release_stale_stream() is False
+            client.set_printer_video_stream.assert_not_called()
+
+            # Watchdog picks it up once the printer is back.
+            client.is_connected = True
+            await cam._idle_watchdog_tick()
+            assert cam._stale_slot_released is True
+            client.set_printer_video_stream.assert_called_once_with(enable=False)
+
+        _run(run())
+
+    def test_watchdog_does_not_re_release_once_done(self) -> None:
+        """The startup release happens once, not on every watchdog pass."""
+
+        async def run() -> None:
+            client = _make_client()
+            cam = _cc2_camera(client)
+            cam._stale_slot_released = True
+            await cam._idle_watchdog_tick()
+            client.set_printer_video_stream.assert_not_called()
+
+        _run(run())
+
+    def test_disable_on_home_assistant_stop(self) -> None:
+        """A shutdown mid-snapshot does not leave the stream enabled."""
+
+        async def run() -> None:
+            client = _make_client()
+            cam = _cc2_camera(client)
+            cam._stream_enabled = True
+            cam._schedule_disable()
+            await cam._async_disable_on_stop(MagicMock())
+            client.set_printer_video_stream.assert_called_once_with(enable=False)
+            assert cam._stream_enabled is False
+            assert cam._pending_disable_task is None
+
+        _run(run())
+
+    def test_failed_disable_keeps_flag_for_watchdog_retry(self) -> None:
+        """If the disable fails, the stream is not assumed to be off."""
+
+        async def run() -> None:
+            client = _make_client()
+            client.set_printer_video_stream = AsyncMock(side_effect=OSError("boom"))
+            cam = _cc2_camera(client)
+            cam._stream_enabled = True
+            await cam._disable_stream()
+            assert cam._stream_enabled is True
+
+            # Watchdog retries and succeeds.
+            client.set_printer_video_stream = AsyncMock()
+            cam._stale_slot_released = True
+            await cam._idle_watchdog_tick()
+            assert cam._stream_enabled is False
+
+        _run(run())
+
+    def test_cleanup_cancels_debounce_and_disables(self) -> None:
+        """Entity removal disables immediately rather than waiting."""
+
+        async def run() -> None:
+            client = _make_client()
+            cam = _cc2_camera(client)
+            cam._stream_enabled = True
+            cam._schedule_disable()
+            pending = cam._pending_disable_task
+            await cam._cleanup_video_lifecycle()
+            assert pending.cancelled()
+            assert cam._pending_disable_task is None
+            client.set_printer_video_stream.assert_called_once_with(enable=False)
+            assert cam._stream_enabled is False
 
         _run(run())
 
@@ -445,14 +572,13 @@ class TestNonCC2Unaffected:
                     "async_camera_image",
                     AsyncMock(return_value=JPEG),
                 ) as base,
-                patch.object(cam, "_wait_for_stream_ready", AsyncMock()) as ready,
-                patch.object(cam, "_fetch_single_frame", AsyncMock()) as fetch,
+                patch.object(cam, "_grab_frame", AsyncMock()) as grab,
             ):
                 image = await cam.async_camera_image()
             assert image == JPEG
             base.assert_awaited_once()
-            ready.assert_not_called()
-            fetch.assert_not_called()
+            # No CC2 retry/grab machinery on other transports.
+            grab.assert_not_called()
 
         _run(run())
 

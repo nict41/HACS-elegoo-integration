@@ -6,7 +6,7 @@
   "dependencies": ["ffmpeg"],
   "documentation": "https://github.com/danielcherubini/elegoo-homeassistant",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/danielcherubini/elegoo-homeassistant/issues",
+  "issue_tracker": "https://github.com/nict41/HACS-elegoo-integration/issues",
   "requirements": ["aiomqtt>=2.4.0"],
   "version": "2.12.2.1"
 }
