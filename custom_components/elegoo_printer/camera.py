@@ -86,6 +86,10 @@ CC2_CAMERA_PORT_CANDIDATES = (8080, 8081, 80, 8000, 8888, 554, 8554)
 PORT_PROBE_INTERVAL = 1800.0  # re-probe at most every 30 min, not once ever
 CAMERA_STATS_INTERVAL = 600.0  # seconds between camera activity summaries
 
+# Every CC2 camera diagnostic line carries this marker so a whole session's
+# timeline can be pulled out of a Home Assistant log with one grep.
+LOG_MARKER = "CC2CAM"
+
 
 class ElegooCameraMjpeg(CameraMjpeg):
     """
@@ -203,6 +207,8 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
             0,
         )
         self._stats_last_logged: float | None = None
+        self._grab_seq = 0
+        self._grab_stream_was_enabled = False
 
     def _log_grab_failure(self, reason: str, *args: object) -> None:
         """
@@ -222,13 +228,13 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         ):
             self._last_grab_failure_log = now
             LOGGER.warning(
-                "Camera image grab failed for %s: " + reason,
+                LOG_MARKER + " grab failed for %s: " + reason,
                 self.entity_id,
                 *args,
             )
         else:
             LOGGER.debug(
-                "Camera image grab failed for %s: " + reason,
+                LOG_MARKER + " grab failed for %s: " + reason,
                 self.entity_id,
                 *args,
             )
@@ -245,13 +251,12 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         """
         Periodically log what this camera has done and what the printer sees.
 
-        Emitted at most every CAMERA_STATS_INTERVAL, and only when there
-        has been activity, so an hour of running produces a short,
-        readable timeline that can be lined up against the printer's own
-        video slot and camera_status changes.
+        Emitted every CAMERA_STATS_INTERVAL whether or not anything
+        happened, so the log carries a steady heartbeat of the printer's
+        camera state. A camera that dies while Home Assistant is idle
+        looks different from one that dies during a grab, and only a
+        heartbeat can tell those apart.
         """
-        if not any(self._stats.values()):
-            return
         now = asyncio.get_running_loop().time()
         if (
             self._stats_last_logged is not None
@@ -262,7 +267,7 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         num_connected, max_allowed = self._capacity_counters()
         attrs = self._printer_client.printer_data.attributes
         LOGGER.info(
-            "Camera activity for %s: %s | printer now reports "
+            LOG_MARKER + " activity for %s: %s | printer now reports "
             "%d/%d video slots in use, camera_status=%s, stream_enabled=%s, "
             "passive=%s",
             self.entity_id,
@@ -1038,7 +1043,7 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                         await writer.wait_closed()
 
         LOGGER.warning(
-            "CC2 camera port probe for %s on %s: %s",
+            LOG_MARKER + " port probe for %s on %s: %s",
             self.entity_id,
             host,
             ", ".join(results),
@@ -1056,71 +1061,116 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         stream. At most one connection to the camera is open at a time.
         """
         async with self._stream_lock:
-            # A grab is starting: keep whatever stream is already up.
-            self._cancel_pending_disable()
-            # Retrying only pays off right after an enable, when the
-            # printer has acknowledged but may not be listening yet. A
-            # stream that was already up is listening by definition.
-            stream_was_enabled = self._stream_enabled
-            if not self._has_active_viewers():
-                await self._update_stream_url()
-            self._transient_viewers += 1
+            self._grab_seq += 1
+            seq = self._grab_seq
+            started = asyncio.get_running_loop().time()
+            slots_before = self._capacity_counters()
+            outcome = "error"
+            size = 0
             try:
-                if not self._mjpeg_url:
-                    self._log_grab_failure(
-                        "no stream URL (printer connected=%s)",
-                        self._printer_client.is_connected,
-                    )
-                    return None
-                if self._is_over_capacity():
-                    num_connected, max_allowed = self._capacity_counters()
-                    self._log_grab_failure(
-                        "printer reports video capacity exhausted "
-                        "(num_video_stream_connected=%d, "
-                        "max_video_stream_allowed=%d)",
-                        num_connected,
-                        max_allowed,
-                    )
-                    return None
-
-                url = self._mjpeg_url
-                image = await self._grab_frame(url, allow_retry=not stream_was_enabled)
-                if image is not None:
-                    return image
-
-                # Fall back to Home Assistant's own MJPEG image path once
-                # before giving up — it uses httpx rather than aiohttp, so
-                # it can still succeed where the direct grab did not. It
-                # opens one connection, and the direct grab's is closed.
-                LOGGER.debug(
-                    "Direct frame grab returned nothing for %s, "
-                    "falling back to the MjpegCamera stream path",
-                    self.entity_id,
-                )
-                try:
-                    image = await super().async_camera_image(width=width, height=height)
-                except Exception as err:
-                    # Logged for diagnosis, then re-raised: Home Assistant
-                    # reports a failed snapshot on an exception but returns
-                    # silently on None, so swallowing would hide the failure.
-                    self._log_grab_failure(
-                        "MjpegCamera fallback raised %s: %s",
-                        type(err).__name__,
-                        err,
-                    )
-                    raise
+                image = await self._run_cc2_grab(width, height)
+            except Exception as err:
+                outcome = f"exception:{type(err).__name__}"
+                raise
+            else:
                 if image is None:
-                    self._log_grab_failure(
-                        "MjpegCamera fallback also returned no image from %s", url
-                    )
+                    outcome = "failed"
+                else:
+                    outcome = "ok"
+                    size = len(image)
                 return image
             finally:
-                self._transient_viewers = max(0, self._transient_viewers - 1)
-                # Only disable if no other viewers are active. Debounced so a
-                # snapshot automation running every few seconds does not
-                # re-toggle the printer's video for every frame.
-                if not self._has_active_viewers():
-                    self._schedule_disable()
+                # One line per snapshot, at INFO, so the whole cycle can be
+                # read without debug logging: what we did, what came back,
+                # and what the printer's slot count did across it.
+                attrs = self._printer_client.printer_data.attributes
+                LOGGER.info(
+                    LOG_MARKER + " grab #%d for %s: result=%s bytes=%d "
+                    "duration=%.2fs stream_was_enabled=%s passive=%s "
+                    "slots_before=%d/%d slots_after=%d/%d camera_status=%s",
+                    seq,
+                    self.entity_id,
+                    outcome,
+                    size,
+                    asyncio.get_running_loop().time() - started,
+                    self._grab_stream_was_enabled,
+                    self._cc2_passive,
+                    slots_before[0],
+                    slots_before[1],
+                    *self._capacity_counters(),
+                    getattr(attrs, "camera_status", None),
+                )
+
+    async def _run_cc2_grab(
+        self, width: int | None, height: int | None
+    ) -> bytes | None:
+        """Do the actual CC2 grab, wrapped by the per-cycle summary log."""
+        # A grab is starting: keep whatever stream is already up.
+        self._cancel_pending_disable()
+        # Retrying only pays off right after an enable, when the
+        # printer has acknowledged but may not be listening yet. A
+        # stream that was already up is listening by definition.
+        stream_was_enabled = self._stream_enabled
+        self._grab_stream_was_enabled = stream_was_enabled
+        if not self._has_active_viewers():
+            await self._update_stream_url()
+        self._transient_viewers += 1
+        try:
+            if not self._mjpeg_url:
+                self._log_grab_failure(
+                    "no stream URL (printer connected=%s)",
+                    self._printer_client.is_connected,
+                )
+                return None
+            if self._is_over_capacity():
+                num_connected, max_allowed = self._capacity_counters()
+                self._log_grab_failure(
+                    "printer reports video capacity exhausted "
+                    "(num_video_stream_connected=%d, "
+                    "max_video_stream_allowed=%d)",
+                    num_connected,
+                    max_allowed,
+                )
+                return None
+
+            url = self._mjpeg_url
+            image = await self._grab_frame(url, allow_retry=not stream_was_enabled)
+            if image is not None:
+                return image
+
+            # Fall back to Home Assistant's own MJPEG image path once
+            # before giving up — it uses httpx rather than aiohttp, so
+            # it can still succeed where the direct grab did not. It
+            # opens one connection, and the direct grab's is closed.
+            LOGGER.debug(
+                "Direct frame grab returned nothing for %s, "
+                "falling back to the MjpegCamera stream path",
+                self.entity_id,
+            )
+            try:
+                image = await super().async_camera_image(width=width, height=height)
+            except Exception as err:
+                # Logged for diagnosis, then re-raised: Home Assistant
+                # reports a failed snapshot on an exception but returns
+                # silently on None, so swallowing would hide the failure.
+                self._log_grab_failure(
+                    "MjpegCamera fallback raised %s: %s",
+                    type(err).__name__,
+                    err,
+                )
+                raise
+            if image is None:
+                self._log_grab_failure(
+                    "MjpegCamera fallback also returned no image from %s", url
+                )
+            return image
+        finally:
+            self._transient_viewers = max(0, self._transient_viewers - 1)
+            # Only disable if no other viewers are active. Debounced so a
+            # snapshot automation running every few seconds does not
+            # re-toggle the printer's video for every frame.
+            if not self._has_active_viewers():
+                self._schedule_disable()
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
