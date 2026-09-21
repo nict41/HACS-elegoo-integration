@@ -1,5 +1,41 @@
 # Elegoo Printers for Home Assistant
 
+> ## Credits — this is a private copy, not the original project
+>
+> **All of the work here is by [Daniel Cherubini (@danielcherubini)](https://github.com/danielcherubini)
+> and the contributors to [danielcherubini/elegoo-homeassistant](https://github.com/danielcherubini/elegoo-homeassistant).**
+> That is the upstream project, the one you should star, watch and install
+> from. Please send bug reports and feature requests there, not here.
+>
+> This repository is a personal copy of upstream **v2.12.2**, with the full
+> upstream git history preserved, carrying one local change: a fix for
+> Centauri Carbon 2 chamber-camera snapshots. It exists only so that fix can
+> be run before it is available upstream, and it is not intended for general
+> use or redistribution.
+>
+> Licensed under the MIT License, © 2019–2026 Daniel Cherubini
+> (see [LICENSE](LICENSE)). The upstream `LICENSE` and copyright notice are
+> retained unchanged, as the licence requires.
+>
+> | | |
+> |---|---|
+> | Upstream project | <https://github.com/danielcherubini/elegoo-homeassistant> |
+> | Forked at | `v2.12.2` (commit `67b2b59`) |
+> | This version | `2.12.2.1` |
+> | Local change | CC2 chamber-camera snapshot fix ([details](#local-change-cc2-chamber-camera-snapshots)) |
+>
+> ### Local change: CC2 chamber camera snapshots
+>
+> `camera.snapshot` on a Centauri Carbon 2 chamber camera always failed. The
+> CC2's camera allows **one** concurrent viewer, so the fix is built around
+> never spending more than one connection at a time and never leaving a
+> connection slot occupied: a single retrying frame grab, an `asyncio.Lock`
+> around enable/grab/disable, a debounced disable, an unconditional
+> slot-releasing disable at startup, and a disable on Home Assistant
+> shutdown. It is scoped to `TransportType.CC2_MQTT`, so SDCP, resin and CC1
+> printers behave exactly as upstream. See `custom_components/elegoo_printer/camera.py`.
+
+
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg)](https://github.com/hacs/integration)
 ![GitHub stars](https://img.shields.io/github/stars/danielcherubini/elegoo-homeassistant)
 ![GitHub issues](https://img.shields.io/github/issues/danielcherubini/elegoo-homeassistant)

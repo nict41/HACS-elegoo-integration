@@ -14,14 +14,14 @@ from homeassistant.components.ffmpeg import (
     async_get_image,
 )
 from homeassistant.components.mjpeg.camera import MjpegCamera
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.helpers.aiohttp_client import (
     async_aiohttp_proxy_stream,
     async_get_clientsession,
 )
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from propcache.api import cached_property
-from yarl import URL
 
 from custom_components.elegoo_printer.const import (
     CONF_CAMERA_ENABLED,
@@ -54,31 +54,26 @@ FFMPEG_TERMINATE_TIMEOUT = 5  # seconds to wait after SIGTERM before SIGKILL
 NATIVE_STREAM_IDLE_TIMEOUT = 600  # 10 minutes — clear native stream flag after idle
 IDLE_WATCHDOG_INTERVAL = 60  # seconds between idle checks
 
-# CC2 chamber camera snapshot tuning. The printer acknowledges the enable
-# command (method 1042) before its MJPEG server is necessarily accepting
-# connections, so a grab issued immediately after the ack can hit a socket
-# that is not listening yet.
-STREAM_READY_TIMEOUT = 5.0  # max seconds to wait for the stream server
-STREAM_READY_INITIAL_DELAY = 0.2  # first backoff step
-STREAM_READY_MAX_DELAY = 1.0  # backoff ceiling
+# CC2 chamber camera snapshot tuning.
+#
+# Upstream's own research (docs/research/issue-414-cc2-proxy-connection.md)
+# records the CC2 camera on :8080 as "none, 1 viewer" — exactly one
+# concurrent connection. Everything below is built around never spending
+# more than one at a time, because a slot the printer thinks is in use is
+# not obviously recoverable without power-cycling it.
+#
+# The printer also acknowledges the enable command (method 1042) before its
+# MJPEG server is necessarily accepting connections, so the frame grab
+# itself is retried rather than being preceded by a separate probe
+# connection.
 FRAME_FETCH_TIMEOUT = 10.0  # seconds for a single-frame grab
+FRAME_RETRY_TIMEOUT = 5.0  # total budget for connect retries after an enable
+FRAME_RETRY_INITIAL_DELAY = 0.2  # first backoff step
+FRAME_RETRY_MAX_DELAY = 1.0  # backoff ceiling
 FRAME_FETCH_MAX_BYTES = 4 * 1024 * 1024  # give up rather than read a stream forever
 BUFFER_SIZE = 102400  # matches homeassistant.components.mjpeg.camera
 DISABLE_DEBOUNCE_DELAY = 5.0  # keep video on briefly so back-to-back grabs reuse it
 GRAB_FAILURE_LOG_INTERVAL = 300.0  # seconds between repeated grab-failure warnings
-
-# Candidate snapshot/stream paths probed once, at WARNING, after a CC2 grab
-# fails. NONE of these are documented for CC2 firmware — the probe exists to
-# find out which (if any) the camera actually serves, without guessing in the
-# hot path.
-CC2_PROBE_PATHS = (
-    "/?action=snapshot",
-    "/?action=stream",
-    "/snapshot",
-    "/stream",
-    "/video",
-    "/",
-)
 
 
 class ElegooCameraMjpeg(CameraMjpeg):
@@ -178,7 +173,7 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         self._stream_lock = asyncio.Lock()
         self._pending_disable_task: asyncio.Task | None = None
         self._last_grab_failure_log = 0.0
-        self._endpoints_probed = False
+        self._stale_slot_released = False
 
     def _log_grab_failure(self, reason: str, *args: object) -> None:
         """
@@ -210,6 +205,44 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
             getattr(attrs, "num_video_stream_connected", 0) or 0,
             getattr(attrs, "max_video_stream_allowed", 0) or 0,
         )
+
+    async def _release_stale_stream(self) -> bool:
+        """
+        Send one unconditional disable to free a slot left enabled earlier.
+
+        The printer keeps the video stream enabled across Home Assistant
+        restarts, and the CC2 allows a single viewer. If Home Assistant
+        was killed, crashed, or lost the printer between an enable and
+        its disable, that slot stays occupied with nothing on this side
+        tracking it — _stream_enabled starts False, so the normal disable
+        path would never touch it.
+
+        Sending one disable at startup costs a single command and clears
+        exactly that case. It is a no-op when nothing leaked.
+
+        Returns:
+            True once the command has been sent (or the printer said no
+            and there is nothing more to do), False if it should be
+            retried later because the client was not connected.
+
+        """
+        if not self._printer_client.is_connected:
+            return False
+        try:
+            await self._printer_client.set_printer_video_stream(enable=False)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug(
+                "Startup video-disable for %s failed, will retry: %s",
+                self.entity_id,
+                err,
+            )
+            return False
+        self._stream_enabled = False
+        LOGGER.debug(
+            "Sent startup video-disable for %s to release any stale video slot",
+            self.entity_id,
+        )
+        return True
 
     def _cancel_pending_disable(self) -> None:
         """Cancel a debounced disable so the enabled stream is reused."""
@@ -341,6 +374,9 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
            NATIVE_STREAM_IDLE_TIMEOUT, clear the native-stream flag
            (allows a future disable attempt).
         """
+        if self._is_cc2 and not self._stale_slot_released:
+            # The printer was not reachable when the entity was added.
+            self._stale_slot_released = await self._release_stale_stream()
         if self._stream_enabled and not self._has_active_viewers():
             await self._disable_stream()
         if (
@@ -375,8 +411,13 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
     async def _cleanup_video_lifecycle(self) -> None:
         """Cancel the idle watchdog and release the video stream state."""
         # Drop any debounced disable — the explicit _disable_stream() below
-        # supersedes it, and a pending task would outlive the entity.
+        # supersedes it. Awaited so the task cannot outlive the entity and
+        # fire a disable against a client that is being torn down.
+        task = self._pending_disable_task
         self._cancel_pending_disable()
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         if self._idle_watchdog_task is not None:
             self._idle_watchdog_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -391,6 +432,27 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         """Start the idle watchdog when the entity is added."""
         await super().async_added_to_hass()
         self._idle_watchdog_task = asyncio.create_task(self._idle_watchdog())
+        if self._is_cc2:
+            # Free a slot a previous Home Assistant run may have left
+            # enabled, and make sure this run cannot leak one on the way
+            # out. Both are CC2-only: it is the transport with a
+            # single-viewer camera.
+            self._stale_slot_released = await self._release_stale_stream()
+            self.async_on_remove(
+                self.hass.bus.async_listen_once(
+                    EVENT_HOMEASSISTANT_STOP, self._async_disable_on_stop
+                )
+            )
+
+    async def _async_disable_on_stop(self, _event: "Event") -> None:
+        """
+        Disable the printer video when Home Assistant shuts down.
+
+        async_will_remove_from_hass does not run on every shutdown path,
+        and an enabled stream survives the restart on the printer side.
+        """
+        self._cancel_pending_disable()
+        await self._disable_stream()
 
     async def async_will_remove_from_hass(self) -> None:
         """
@@ -687,77 +749,23 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
             self._stream_enabled = False
             self._mjpeg_url = None
 
-    async def _wait_for_stream_ready(self, url: str) -> bool:
+    async def _fetch_frame_once(self, url: str) -> tuple[bytes | None, bool]:
         """
-        Wait until the printer's MJPEG server answers on `url`.
+        Pull one JPEG frame over a single short-lived connection.
 
-        The CC2 acknowledges the enable command before its camera server
-        is necessarily listening, so grabbing a frame straight after the
-        ack can hit a closed socket. Polls with backoff for at most
-        STREAM_READY_TIMEOUT seconds.
+        The CC2 camera allows one viewer, so this opens exactly one
+        connection, reads until it has a whole frame, and closes. Unlike
+        Home Assistant's MjpegCamera image path this checks the HTTP
+        status and logs it, so a wrong URL shows up as a real message
+        instead of a silent None.
 
         Returns:
-            True if the server answered, False if it never did.
+            (frame, retryable). `retryable` is True only for connection
+            errors — the case where the printer has not finished bringing
+            its camera server up. A reply that arrived is never retried,
+            because a retry would spend another connection slot for
+            nothing.
 
-        """
-        session = async_get_clientsession(self.hass)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + STREAM_READY_TIMEOUT
-        delay = STREAM_READY_INITIAL_DELAY
-        attempt = 0
-        last_error = "no attempt made"
-
-        while loop.time() < deadline:
-            attempt += 1
-            try:
-                # Headers only: enough to prove the server is listening
-                # without pulling frames we are about to discard.
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=STREAM_READY_MAX_DELAY * 2)
-                ) as response:
-                    LOGGER.debug(
-                        "Stream readiness probe for %s attempt %d: HTTP %d (%s)",
-                        self.entity_id,
-                        attempt,
-                        response.status,
-                        response.headers.get("Content-Type", "no content-type"),
-                    )
-                    if response.status < HTTPStatus.BAD_REQUEST:
-                        return True
-                    last_error = f"HTTP {response.status}"
-            except (TimeoutError, aiohttp.ClientError, OSError) as err:
-                last_error = f"{type(err).__name__}: {err}"
-                LOGGER.debug(
-                    "Stream readiness probe for %s attempt %d failed: %s",
-                    self.entity_id,
-                    attempt,
-                    last_error,
-                )
-
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            await asyncio.sleep(min(delay, remaining))
-            delay = min(delay * 2, STREAM_READY_MAX_DELAY)
-
-        self._log_grab_failure(
-            "stream server at %s not ready after %.1fs (%d attempts, last: %s)",
-            url,
-            STREAM_READY_TIMEOUT,
-            attempt,
-            last_error,
-        )
-        return False
-
-    async def _fetch_single_frame(self, url: str) -> bytes | None:
-        """
-        Pull one JPEG frame from the MJPEG stream and close the connection.
-
-        Holding the stream open for as short a time as possible matters
-        on the CC2, which advertises very few concurrent video
-        connections. Unlike Home Assistant's MjpegCamera image path this
-        checks the HTTP status and logs it, so a wrong URL or path shows
-        up as a real message instead of a silent None.
         """
         session = async_get_clientsession(self.hass)
         try:
@@ -770,7 +778,7 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                         resp.status,
                         content_type,
                     )
-                    return None
+                    return None, False
 
                 LOGGER.debug(
                     "Reading frame for %s from %s (HTTP %d, %s)",
@@ -783,16 +791,11 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                 async for chunk in resp.content.iter_chunked(BUFFER_SIZE):
                     data += chunk
                     jpg_end = data.find(b"\xff\xd9")
-                    if jpg_end == -1:
-                        if len(data) > FRAME_FETCH_MAX_BYTES:
-                            break
-                        continue
                     jpg_start = data.find(b"\xff\xd8")
-                    if jpg_start == -1:
-                        if len(data) > FRAME_FETCH_MAX_BYTES:
-                            break
-                        continue
-                    return data[jpg_start : jpg_end + 2]
+                    if jpg_end != -1 and jpg_start != -1 and jpg_start < jpg_end:
+                        return data[jpg_start : jpg_end + 2], False
+                    if len(data) > FRAME_FETCH_MAX_BYTES:
+                        break
 
                 self._log_grab_failure(
                     "no JPEG frame in %d bytes from %s (%s)",
@@ -800,56 +803,67 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                     url,
                     content_type,
                 )
+                return None, False
         except TimeoutError:
             self._log_grab_failure(
                 "timed out after %.0fs reading a frame from %s",
                 FRAME_FETCH_TIMEOUT,
                 url,
             )
+            return None, False
         except (aiohttp.ClientError, OSError) as err:
-            self._log_grab_failure(
-                "error reading a frame from %s - %s: %s",
+            # Could not get a reply at all — the camera server may still be
+            # coming up after the enable acknowledgement.
+            LOGGER.debug(
+                "Frame grab for %s could not reach %s - %s: %s",
+                self.entity_id,
                 url,
                 type(err).__name__,
                 err,
             )
-        return None
+            return None, True
 
-    async def _probe_endpoints(self, url: str) -> None:
+    async def _grab_frame(self, url: str, *, allow_retry: bool) -> bytes | None:
         """
-        Log what the camera host actually serves, once per entity.
+        Grab a frame, retrying only while the camera server refuses to answer.
 
-        Runs only after a CC2 grab has failed. None of CC2_PROBE_PATHS are
-        documented for CC2 firmware; the point is to record what the
-        printer answers on so the correct endpoint can be identified from
-        a log instead of guessed.
+        One connection is in flight at any moment. Retries are bounded by
+        FRAME_RETRY_TIMEOUT and only happen when the stream was just
+        enabled, which is the window where the printer has acknowledged
+        the enable but is not listening yet.
         """
-        if self._endpoints_probed:
-            return
-        self._endpoints_probed = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + FRAME_RETRY_TIMEOUT
+        delay = FRAME_RETRY_INITIAL_DELAY
+        attempts = 0
 
-        base = URL(url).origin()
-        session = async_get_clientsession(self.hass)
-        results: list[str] = []
-        for path in CC2_PROBE_PATHS:
-            candidate = str(base.join(URL(path)))
-            try:
-                async with session.get(
-                    candidate, timeout=aiohttp.ClientTimeout(total=2)
-                ) as resp:
-                    results.append(
-                        f"{path} -> HTTP {resp.status} "
-                        f"({resp.headers.get('Content-Type', 'no content-type')})"
+        while True:
+            attempts += 1
+            image, retryable = await self._fetch_frame_once(url)
+            if image is not None:
+                if attempts > 1:
+                    LOGGER.debug(
+                        "Frame grab for %s succeeded on attempt %d "
+                        "(camera server needed time after the enable)",
+                        self.entity_id,
+                        attempts,
                     )
-            except (TimeoutError, aiohttp.ClientError, OSError) as err:
-                results.append(f"{path} -> {type(err).__name__}: {err}")
+                return image
+            if not (retryable and allow_retry):
+                return None
 
-        LOGGER.warning(
-            "CC2 camera endpoint probe for %s at %s: %s",
-            self.entity_id,
-            base,
-            "; ".join(results),
-        )
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self._log_grab_failure(
+                    "camera server at %s never accepted a connection "
+                    "within %.1fs (%d attempts)",
+                    url,
+                    FRAME_RETRY_TIMEOUT,
+                    attempts,
+                )
+                return None
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, FRAME_RETRY_MAX_DELAY)
 
     async def _async_cc2_camera_image(
         self, width: int | None, height: int | None
@@ -860,14 +874,14 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         Serialized on _stream_lock so overlapping snapshot calls cannot
         toggle the printer's video on and off underneath each other, and
         the disable is debounced so consecutive grabs reuse one enabled
-        stream.
+        stream. At most one connection to the camera is open at a time.
         """
         async with self._stream_lock:
             # A grab is starting: keep whatever stream is already up.
             self._cancel_pending_disable()
-            # A stream that was already enabled (reused inside the debounce
-            # window) is already listening, so the readiness probe below is
-            # only worth its extra connection right after an enable.
+            # Retrying only pays off right after an enable, when the
+            # printer has acknowledged but may not be listening yet. A
+            # stream that was already up is listening by definition.
             stream_was_enabled = self._stream_enabled
             if not self._has_active_viewers():
                 await self._update_stream_url()
@@ -891,19 +905,14 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                     return None
 
                 url = self._mjpeg_url
-                if not stream_was_enabled and not await self._wait_for_stream_ready(
-                    url
-                ):
-                    await self._probe_endpoints(url)
-                    return None
-
-                image = await self._fetch_single_frame(url)
+                image = await self._grab_frame(url, allow_retry=not stream_was_enabled)
                 if image is not None:
                     return image
 
-                # Fall back to Home Assistant's own MJPEG image path before
-                # giving up — it uses httpx rather than aiohttp, so it can
-                # still succeed where the direct grab did not.
+                # Fall back to Home Assistant's own MJPEG image path once
+                # before giving up — it uses httpx rather than aiohttp, so
+                # it can still succeed where the direct grab did not. It
+                # opens one connection, and the direct grab's is closed.
                 LOGGER.debug(
                     "Direct frame grab returned nothing for %s, "
                     "falling back to the MjpegCamera stream path",
@@ -925,7 +934,6 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                     self._log_grab_failure(
                         "MjpegCamera fallback also returned no image from %s", url
                     )
-                    await self._probe_endpoints(url)
                 return image
             finally:
                 self._transient_viewers = max(0, self._transient_viewers - 1)
