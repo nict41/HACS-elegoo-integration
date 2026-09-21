@@ -1247,7 +1247,7 @@ class ElegooCC2Client:
         self._last_video_slot_count = num
         if previous_num is None:
             self.logger.info(
-                "CC2 camera baseline: %d/%d video slots in use, camera_status=%s",
+                "CC2CAM baseline: %d/%d video slots in use, camera_status=%s",
                 num,
                 max_allowed,
                 status,
@@ -1255,7 +1255,7 @@ class ElegooCC2Client:
         elif num != previous_num:
             if max_allowed and num >= max_allowed:
                 self.logger.warning(
-                    "CC2 video slots EXHAUSTED: %d -> %d of %d in use "
+                    "CC2CAM video slots EXHAUSTED: %d -> %d of %d in use "
                     "(camera_status=%s). Further camera connections will fail "
                     "until slots are released.",
                     previous_num,
@@ -1265,7 +1265,7 @@ class ElegooCC2Client:
                 )
             else:
                 self.logger.info(
-                    "CC2 video slots: %d -> %d of %d in use (camera_status=%s)",
+                    "CC2CAM video slots: %d -> %d of %d in use (camera_status=%s)",
                     previous_num,
                     num,
                     max_allowed,
@@ -1276,7 +1276,7 @@ class ElegooCC2Client:
         self._last_camera_status = status
         if previous_status is not None and status != previous_status:
             self.logger.warning(
-                "CC2 camera_status changed: %s -> %s "
+                "CC2CAM camera_status changed: %s -> %s "
                 "(0=disconnected, 1=connected). A drop to 0 means the printer "
                 "itself has lost the camera.",
                 previous_status,
@@ -1288,7 +1288,7 @@ class ElegooCC2Client:
         # Logged verbatim so the fields the firmware actually sends back for
         # method 1042 can be confirmed from a debug log - in particular
         # whether it ever carries a video_url of its own.
-        self.logger.debug("CC2 video (method 1042) raw response: %s", video_data)
+        self.logger.debug("CC2CAM video (method 1042) raw response: %s", video_data)
         error_code = video_data.get("error_code", 0)
 
         # CC2 may return video_url directly or just success
@@ -1302,7 +1302,8 @@ class ElegooCC2Client:
             # it actually answers on.
             video_url = f"http://{self.printer_ip}:8080/?action=stream"
             self.logger.debug(
-                "CC2 video response carried no video_url; using assumed stream URL: %s",
+                "CC2CAM video response carried no video_url; "
+                "using assumed stream URL: %s",
                 video_url,
             )
 
