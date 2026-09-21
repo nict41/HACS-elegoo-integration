@@ -292,6 +292,53 @@ class TestCC2CameraImage:
 
         _run(run())
 
+    def test_reused_stream_skips_readiness_probe(self) -> None:
+        """
+        An already-enabled stream goes straight to the grab.
+
+        The readiness probe costs a connection, which matters when the
+        printer allows very few. It is only worth it right after an enable.
+        """
+
+        async def run() -> None:
+            client = _make_client()
+            cam = _cc2_camera(client)
+            cam._mjpeg_url = STREAM_URL
+            cam._stream_enabled = True
+            session = _FakeSession([_FakeResponse()])
+            with (
+                _patch_session(session),
+                patch.object(cam, "_wait_for_stream_ready", AsyncMock()) as ready,
+            ):
+                image = await cam.async_camera_image()
+            assert image == JPEG
+            ready.assert_not_called()
+            # Exactly one connection: the frame grab itself.
+            assert session.calls == [STREAM_URL]
+            cam._cancel_pending_disable()
+
+        _run(run())
+
+    def test_first_grab_after_enable_waits_for_readiness(self) -> None:
+        """A freshly enabled stream is probed before the grab."""
+
+        async def run() -> None:
+            client = _make_client()
+            cam = _cc2_camera(client)
+            session = _FakeSession([_FakeResponse()])
+            with (
+                _patch_session(session),
+                patch.object(
+                    cam, "_wait_for_stream_ready", AsyncMock(return_value=True)
+                ) as ready,
+            ):
+                image = await cam.async_camera_image()
+            assert image == JPEG
+            ready.assert_awaited_once_with(STREAM_URL)
+            cam._cancel_pending_disable()
+
+        _run(run())
+
     def test_over_capacity_logs_counters(self) -> None:
         """The over-capacity path names both counters."""
 
@@ -358,6 +405,11 @@ class TestCC2CameraImage:
             with (
                 _patch_session(session),
                 patch.object(camera_module.asyncio, "sleep", AsyncMock()),
+                patch.object(
+                    camera_module.MjpegCamera,
+                    "async_camera_image",
+                    AsyncMock(return_value=None),
+                ),
                 patch.object(camera_module.LOGGER, "warning") as warn,
             ):
                 assert await cam.async_camera_image() is None

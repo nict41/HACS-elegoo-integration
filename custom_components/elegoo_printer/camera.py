@@ -865,6 +865,10 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         async with self._stream_lock:
             # A grab is starting: keep whatever stream is already up.
             self._cancel_pending_disable()
+            # A stream that was already enabled (reused inside the debounce
+            # window) is already listening, so the readiness probe below is
+            # only worth its extra connection right after an enable.
+            stream_was_enabled = self._stream_enabled
             if not self._has_active_viewers():
                 await self._update_stream_url()
             self._transient_viewers += 1
@@ -887,7 +891,9 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                     return None
 
                 url = self._mjpeg_url
-                if not await self._wait_for_stream_ready(url):
+                if not stream_was_enabled and not await self._wait_for_stream_ready(
+                    url
+                ):
                     await self._probe_endpoints(url)
                     return None
 
