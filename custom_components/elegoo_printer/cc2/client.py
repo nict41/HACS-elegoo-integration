@@ -22,6 +22,10 @@ from typing import TYPE_CHECKING, Any
 
 import aiomqtt
 
+from custom_components.elegoo_printer.const import (
+    CC2_VIDEO_PATH,
+    CC2_VIDEO_PORT,
+)
 from custom_components.elegoo_printer.sdcp.exceptions import (
     ElegooPrinterConnectionError,
     ElegooPrinterNotConnectedError,
@@ -120,6 +124,8 @@ class ElegooCC2Client:
         # every change is logged rather than only sampled when a grab fails.
         self._last_video_slot_count: int | None = None
         self._last_camera_status: int | None = None
+        self._video_command_count = 0
+        self._raw_attrs_logged = False
 
         # MQTT client state
         self.mqtt_client: aiomqtt.Client | None = None
@@ -1216,6 +1222,19 @@ class ElegooCC2Client:
         self.logger.debug("Received attributes update")
         try:
             # Map CC2 attributes to PrinterAttributes
+            if not self._raw_attrs_logged:
+                self._raw_attrs_logged = True
+                # The camera fields are mapped from guessed key names
+                # (video_connections / max_video_connections /
+                # camera_connected). Firmware 02.01.00.00 appears not to send
+                # them, so the mapped values are just the defaults. Log the
+                # payload verbatim once per connection so the real key names
+                # can be read off instead of guessed.
+                self.logger.info(
+                    "CC2CAM raw attributes payload (keys=%s): %s",
+                    sorted(attrs_data),
+                    attrs_data,
+                )
             mapped_attrs = CC2StatusMapper.map_attributes(attrs_data)
             self._log_camera_telemetry(mapped_attrs)
             self.printer_data.attributes = mapped_attrs
@@ -1291,19 +1310,21 @@ class ElegooCC2Client:
         self.logger.debug("CC2CAM video (method 1042) raw response: %s", video_data)
         error_code = video_data.get("error_code", 0)
 
-        # CC2 may return video_url directly or just success
-        # Construct URL for MJPEG stream on port 8080 if successful
-        video_url = video_data.get("video_url", "")
-        if error_code == 0 and not video_url:
-            # ASSUMPTION (unverified against CC2 firmware): the chamber camera
-            # serves MJPEG at :8080/?action=stream, the mjpg-streamer default.
-            # The printer never sends a URL of its own, so this is a guess.
-            # When a grab fails, camera.py probes this host:port and logs what
-            # it actually answers on.
-            video_url = f"http://{self.printer_ip}:8080/?action=stream"
+        # Firmware 02.01.00.00 answers method 1042 with the stream URL under
+        # the key "url": {"error_code": 0, "url": "http://<ip>:8080/?action=stream"}.
+        # "video_url" is kept as a fallback for other firmware revisions.
+        video_url = video_data.get("url") or video_data.get("video_url") or ""
+        if video_url:
             self.logger.debug(
-                "CC2CAM video response carried no video_url; "
-                "using assumed stream URL: %s",
+                "CC2CAM video response supplied stream URL: %s", video_url
+            )
+        elif error_code == 0:
+            # Only reached if the firmware sends neither key.
+            video_url = f"http://{self.printer_ip}:{CC2_VIDEO_PORT}{CC2_VIDEO_PATH}"
+            self.logger.warning(
+                "CC2CAM video response carried no url/video_url key (%s); "
+                "falling back to %s",
+                sorted(video_data),
                 video_url,
             )
 
@@ -1410,6 +1431,15 @@ class ElegooCC2Client:
 
     async def set_printer_video_stream(self, *, enable: bool) -> None:
         """Enable or disable the printer's video stream."""
+        # Counted and logged at INFO: these commands are the integration's
+        # entire write-side footprint on the camera, so a log has to show how
+        # many were sent and when, without debug logging.
+        self._video_command_count += 1
+        self.logger.info(
+            "CC2CAM sending video %s command (method 1042), #%d this session",
+            "ENABLE" if enable else "DISABLE",
+            self._video_command_count,
+        )
         # CC2 expects integer 1/0 not boolean true/false
         await self._send_command(CC2_CMD_SET_VIDEO_STREAM, {"enable": int(enable)})
 

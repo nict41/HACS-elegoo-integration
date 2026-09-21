@@ -1206,9 +1206,7 @@ class ElegooOptionsFlowHandler(config_entries.OptionsFlow):
             vol.Optional(CONF_CC2_ACCESS_CODE): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD),
             ),
-            vol.Optional(
-                CONF_CC2_CAMERA_PASSIVE, default=False
-            ): selector.BooleanSelector(),
+            vol.Optional(CONF_CC2_CAMERA_PASSIVE): selector.BooleanSelector(),
             vol.Optional(CONF_GCODE_PROXY_URL, default=""): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT),
             ),
@@ -1217,6 +1215,11 @@ class ElegooOptionsFlowHandler(config_entries.OptionsFlow):
     @staticmethod
     def _suggested_with_normalized_proxy(settings: dict) -> dict:
         suggested = dict(settings)
+        # Without this the toggle renders unchecked however it is stored, so
+        # simply opening and saving the options would turn passive mode off.
+        suggested[CONF_CC2_CAMERA_PASSIVE] = bool(
+            settings.get(CONF_CC2_CAMERA_PASSIVE, False)
+        )
         proxy_url = (suggested.get(CONF_GCODE_PROXY_URL) or "").strip()
         if proxy_url:
             normalized = _normalize_gcode_proxy_base_url(proxy_url)

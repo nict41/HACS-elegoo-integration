@@ -9,11 +9,13 @@ video control commands at all.
 """
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import custom_components.elegoo_printer.camera as camera_module
 from custom_components.elegoo_printer.camera import ElegooMjpegCamera
 from custom_components.elegoo_printer.cc2.client import ElegooCC2Client
+from custom_components.elegoo_printer.const import CC2_VIDEO_PATH, CC2_VIDEO_PORT
 from custom_components.elegoo_printer.sdcp.models.enums import ElegooVideoStatus
 
 STREAM_URL = "http://printer.invalid:8080/?action=stream"
@@ -62,6 +64,15 @@ def _camera(*, passive: bool = False) -> ElegooMjpegCamera:
     cam._is_cc2 = True
     cam._cc2_passive = passive
     return cam
+
+
+async def _tick_port_watchdog(cam) -> None:
+    """Let the port watchdog complete at least one poll, then stop it."""
+    task = asyncio.create_task(cam._camera_port_watchdog())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 class TestSlotTelemetry:
@@ -333,5 +344,144 @@ class TestPerGrabSummary:
             with patch.object(camera_module.LOGGER, "info") as info:
                 cam._log_activity_summary()
             assert any("activity for" in c[0][0] for c in info.call_args_list)
+
+        _run(run())
+
+
+class TestVideoResponseUrl:
+    """The method-1042 reply carries the stream URL under "url"."""
+
+    def _client(self) -> tuple[ElegooCC2Client, MagicMock]:
+        client = object.__new__(ElegooCC2Client)
+        client.logger = MagicMock()
+        client.printer_ip = "192.168.8.128"
+        client.printer_data = MagicMock()
+        return client, client.logger
+
+    def test_url_key_is_used(self) -> None:
+        """Firmware 02.01.00.00 sends "url", which must be honoured."""
+        client, _ = self._client()
+        client._handle_video_response(
+            {"error_code": 0, "url": "http://192.168.8.128:8080/?action=stream"}
+        )
+        assert (
+            client.printer_data.video.video_url
+            == "http://192.168.8.128:8080/?action=stream"
+        )
+
+    def test_video_url_key_still_works(self) -> None:
+        """Other firmware may use video_url; keep accepting it."""
+        client, _ = self._client()
+        client._handle_video_response(
+            {"error_code": 0, "video_url": "http://host:1234/s"}
+        )
+        assert client.printer_data.video.video_url == "http://host:1234/s"
+
+    def test_missing_url_warns_and_falls_back(self) -> None:
+        """A reply with neither key is a warning, not a silent guess."""
+        client, logger = self._client()
+        client._handle_video_response({"error_code": 0})
+        assert "carried no url/video_url" in logger.warning.call_args[0][0]
+        assert client.printer_data.video.video_url == (
+            f"http://192.168.8.128:{CC2_VIDEO_PORT}{CC2_VIDEO_PATH}"
+        )
+
+
+class TestCameraPortWatchdog:
+    """Transitions of the camera's TCP port, logged as they happen."""
+
+    def test_startup_state_logged_once(self) -> None:
+        """The first observation is a baseline at INFO."""
+
+        async def run() -> None:
+            cam = _camera()
+            with (
+                patch.object(cam, "_is_camera_port_open", AsyncMock(return_value=True)),
+                patch.object(camera_module, "CAMERA_PORT_POLL_INTERVAL", 0),
+                patch.object(camera_module.LOGGER, "info") as info,
+            ):
+                await _tick_port_watchdog(cam)
+            assert any("at startup" in c[0][0] for c in info.call_args_list)
+
+        _run(run())
+
+    def test_open_to_closed_is_a_warning(self) -> None:
+        """The camera dying mid-session is a WARNING with the command count."""
+
+        async def run() -> None:
+            cam = _camera()
+            cam._camera_port_open = True
+            cam._printer_client._video_command_count = 42
+            with (
+                patch.object(
+                    cam, "_is_camera_port_open", AsyncMock(return_value=False)
+                ),
+                patch.object(camera_module, "CAMERA_PORT_POLL_INTERVAL", 0),
+                patch.object(camera_module.LOGGER, "warning") as warn,
+            ):
+                await _tick_port_watchdog(cam)
+            args = warn.call_args[0]
+            assert args[2] == "OPEN"
+            assert args[3] == "CLOSED"
+            assert args[5] == 42
+
+        _run(run())
+
+    def test_steady_state_is_not_logged(self) -> None:
+        """No transition, no line."""
+
+        async def run() -> None:
+            cam = _camera()
+            cam._camera_port_open = True
+            with (
+                patch.object(cam, "_is_camera_port_open", AsyncMock(return_value=True)),
+                patch.object(camera_module, "CAMERA_PORT_POLL_INTERVAL", 0),
+                patch.object(camera_module.LOGGER, "warning") as warn,
+                patch.object(camera_module.LOGGER, "info") as info,
+            ):
+                await _tick_port_watchdog(cam)
+            warn.assert_not_called()
+            assert not any("camera port" in c[0][0] for c in info.call_args_list)
+
+        _run(run())
+
+
+class TestPassiveSendsNothingAtStartup:
+    """Passive mode's promise: zero video commands, including on load."""
+
+    def test_no_startup_disable_in_passive_mode(self) -> None:
+        """The stale-slot release is skipped so the A/B stays clean."""
+
+        async def run() -> None:
+            cam = _camera(passive=True)
+            await cam._idle_watchdog_tick()
+            cam._printer_client.set_printer_video_stream.assert_not_called()
+
+        _run(run())
+
+    def test_active_mode_still_releases_at_startup(self) -> None:
+        """Non-passive keeps the recovery behaviour."""
+
+        async def run() -> None:
+            cam = _camera(passive=False)
+            await cam._idle_watchdog_tick()
+            cam._printer_client.set_printer_video_stream.assert_called_once_with(
+                enable=False
+            )
+
+        _run(run())
+
+
+class TestEnableCounting:
+    """enables_sent must reflect the CC2 grab path, not just the mixin."""
+
+    def test_update_stream_url_counts_the_enable(self) -> None:
+        """The path Run A actually used was previously uncounted."""
+
+        async def run() -> None:
+            cam = _camera(passive=False)
+            cam._mjpeg_url = None
+            await cam._update_stream_url()
+            assert cam._stats["enables_sent"] == 1
 
         _run(run())
