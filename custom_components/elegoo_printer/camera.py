@@ -25,6 +25,8 @@ from propcache.api import cached_property
 from yarl import URL
 
 from custom_components.elegoo_printer.const import (
+    CC2_VIDEO_PATH,
+    CC2_VIDEO_PORT,
     CONF_CAMERA_ENABLED,
     CONF_CC2_CAMERA_PASSIVE,
     LOGGER,
@@ -84,6 +86,7 @@ GRAB_FAILURE_LOG_INTERVAL = 300.0  # seconds between repeated grab-failure warni
 # HTTP request, so it does not register as a viewer.
 CC2_CAMERA_PORT_CANDIDATES = (8080, 8081, 80, 8000, 8888, 554, 8554)
 PORT_PROBE_INTERVAL = 1800.0  # re-probe at most every 30 min, not once ever
+CAMERA_PORT_POLL_INTERVAL = 60.0  # how often to check whether the camera listens
 CAMERA_STATS_INTERVAL = 600.0  # seconds between camera activity summaries
 
 # Every CC2 camera diagnostic line carries this marker so a whole session's
@@ -209,6 +212,8 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         self._stats_last_logged: float | None = None
         self._grab_seq = 0
         self._grab_stream_was_enabled = False
+        self._camera_port_task: asyncio.Task | None = None
+        self._camera_port_open: bool | None = None
 
     def _log_grab_failure(self, reason: str, *args: object) -> None:
         """
@@ -246,6 +251,75 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
             getattr(attrs, "num_video_stream_connected", 0) or 0,
             getattr(attrs, "max_video_stream_allowed", 0) or 0,
         )
+
+    async def _is_camera_port_open(self) -> bool | None:
+        """
+        Check whether the camera's TCP port accepts a connection.
+
+        A bare connect, closed immediately with no HTTP request sent, so
+        it cannot register as a viewer or consume a video slot.
+
+        Returns:
+            True/False, or None if the URL could not be parsed.
+
+        """
+        url = URL(self._mjpeg_url) if self._mjpeg_url else None
+        if url is None or not url.host:
+            return None
+        port = url.port or CC2_VIDEO_PORT
+        writer = None
+        try:
+            async with asyncio.timeout(3):
+                _reader, writer = await asyncio.open_connection(url.host, port)
+        except (TimeoutError, OSError):
+            return False
+        else:
+            return True
+        finally:
+            if writer is not None:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+
+    async def _camera_port_watchdog(self) -> None:
+        """
+        Log the moment the camera's port starts or stops listening.
+
+        The camera server dies on its own schedule, not necessarily during
+        a snapshot, so polling a grab is not enough to time it. Only
+        transitions are logged, which keeps this to a handful of lines per
+        session while pinning the death to within
+        CAMERA_PORT_POLL_INTERVAL seconds.
+        """
+        while True:
+            try:
+                await asyncio.sleep(CAMERA_PORT_POLL_INTERVAL)
+                is_open = await self._is_camera_port_open()
+                if is_open is None or is_open == self._camera_port_open:
+                    continue
+                previous = self._camera_port_open
+                self._camera_port_open = is_open
+                if previous is None:
+                    LOGGER.info(
+                        LOG_MARKER + " camera port for %s is %s at startup (%s)",
+                        self.entity_id,
+                        "OPEN" if is_open else "CLOSED",
+                        self._mjpeg_url,
+                    )
+                else:
+                    LOGGER.warning(
+                        LOG_MARKER + " camera port for %s went %s -> %s (%s). "
+                        "video commands sent this session: %s",
+                        self.entity_id,
+                        "OPEN" if previous else "CLOSED",
+                        "OPEN" if is_open else "CLOSED",
+                        self._mjpeg_url,
+                        getattr(self._printer_client, "_video_command_count", "?"),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Camera port watchdog error for %s", self.entity_id)
 
     def _log_activity_summary(self) -> None:
         """
@@ -455,7 +529,7 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
            (allows a future disable attempt).
         """
         self._log_activity_summary()
-        if self._is_cc2 and not self._stale_slot_released:
+        if self._is_cc2 and not self._cc2_passive and not self._stale_slot_released:
             # The printer was not reachable when the entity was added.
             self._stale_slot_released = await self._release_stale_stream()
         if self._stream_enabled and not self._has_active_viewers():
@@ -499,6 +573,11 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         if task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        if self._camera_port_task is not None:
+            self._camera_port_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._camera_port_task
+            self._camera_port_task = None
         if self._idle_watchdog_task is not None:
             self._idle_watchdog_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -513,17 +592,19 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         """Start the idle watchdog when the entity is added."""
         await super().async_added_to_hass()
         self._idle_watchdog_task = asyncio.create_task(self._idle_watchdog())
-        if self._is_cc2:
+        if self._is_cc2 and not self._cc2_passive:
             # Free a slot a previous Home Assistant run may have left
             # enabled, and make sure this run cannot leak one on the way
-            # out. Both are CC2-only: it is the transport with a
-            # single-viewer camera.
+            # out. Skipped in passive mode, which promises to send no video
+            # commands at all - one stray disable would invalidate the A/B.
             self._stale_slot_released = await self._release_stale_stream()
             self.async_on_remove(
                 self.hass.bus.async_listen_once(
                     EVENT_HOMEASSISTANT_STOP, self._async_disable_on_stop
                 )
             )
+        if self._is_cc2:
+            self._camera_port_task = asyncio.create_task(self._camera_port_watchdog())
 
     async def _async_disable_on_stop(self, _event: "Event") -> None:
         """
@@ -749,7 +830,14 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         """
         # Use centralized proxy with MainboardID routing
         printer = coordinator.config_entry.runtime_data.api.printer
-        if printer.proxy_enabled:
+        is_cc2 = printer.transport_type == TransportType.CC2_MQTT
+        if is_cc2:
+            # VERIFIED on firmware 02.01.00.00: the CC2 serves MJPEG on
+            # :8080/?action=stream and has :3031 closed, so the proxy URL
+            # below never applies to it. Passive mode depends on this URL
+            # being right, because it never asks the printer for one.
+            mjpeg_url = f"http://{printer.ip_address}:{CC2_VIDEO_PORT}{CC2_VIDEO_PATH}"
+        elif printer.proxy_enabled:
             external_ip = getattr(printer, "external_ip", None)
             proxy_ip = PrinterData.get_local_ip(printer.ip_address, external_ip)
             # Use centralized proxy on port 3031 with MainboardID as query parameter
@@ -774,7 +862,7 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         self._init_video_lifecycle(self._printer_client)
         # Only the CC2 takes the readiness-wait/direct-grab path; CC1 and the
         # SDCP printers keep the original behaviour.
-        self._is_cc2 = printer.transport_type == TransportType.CC2_MQTT
+        self._is_cc2 = is_cc2
         # Passive mode: never send the enable/disable command (method 1042),
         # just read the stream. For printers whose camera server runs all the
         # time it removes this integration's control traffic entirely, which
@@ -843,6 +931,7 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         if (not self._printer_client.is_connected) or self._is_over_capacity():
             self._mjpeg_url = None
             return
+        self._stats["enables_sent"] += 1
         video = await self._printer_client.get_printer_video(enable=True)
         if video.status == ElegooVideoStatus.SUCCESS:
             self._stream_enabled = True

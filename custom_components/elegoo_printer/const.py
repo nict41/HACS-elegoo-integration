@@ -43,6 +43,12 @@ DISCOVERY_PORT = 3000
 DISCOVERY_TIMEOUT = 5
 PROXY_HOST = "127.0.0.1"
 VIDEO_ENDPOINT = "video"
+# CC2 chamber camera. VERIFIED against firmware 02.01.00.00: the method-1042
+# response carries {"error_code": 0, "url": "http://<ip>:8080/?action=stream"},
+# and :8080 answers 200 multipart/x-mixed-replace while :3031 is closed. The
+# 3031/video URL below is the CC1 proxy path and does not apply to a CC2.
+CC2_VIDEO_PORT = 8080
+CC2_VIDEO_PATH = "/?action=stream"
 VIDEO_PORT = 3031
 WEBSOCKET_PORT = 3030
 
