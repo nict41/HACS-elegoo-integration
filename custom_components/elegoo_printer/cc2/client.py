@@ -1220,14 +1220,26 @@ class ElegooCC2Client:
 
     def _handle_video_response(self, video_data: dict[str, Any]) -> None:
         """Handle video stream response."""
+        # Logged verbatim so the fields the firmware actually sends back for
+        # method 1042 can be confirmed from a debug log - in particular
+        # whether it ever carries a video_url of its own.
+        self.logger.debug("CC2 video (method 1042) raw response: %s", video_data)
         error_code = video_data.get("error_code", 0)
 
         # CC2 may return video_url directly or just success
         # Construct URL for MJPEG stream on port 8080 if successful
         video_url = video_data.get("video_url", "")
         if error_code == 0 and not video_url:
-            # No URL provided but success - construct default stream URL
+            # ASSUMPTION (unverified against CC2 firmware): the chamber camera
+            # serves MJPEG at :8080/?action=stream, the mjpg-streamer default.
+            # The printer never sends a URL of its own, so this is a guess.
+            # When a grab fails, camera.py probes this host:port and logs what
+            # it actually answers on.
             video_url = f"http://{self.printer_ip}:8080/?action=stream"
+            self.logger.debug(
+                "CC2 video response carried no video_url; using assumed stream URL: %s",
+                video_url,
+            )
 
         # Convert to format ElegooVideo expects
         converted_data = {
