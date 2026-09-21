@@ -21,6 +21,7 @@ from custom_components.elegoo_printer.sdcp.models.enums import ElegooVideoStatus
 
 JPEG = b"\xff\xd8" + b"payload" + b"\xff\xd9"
 STREAM_URL = "http://printer.invalid:8080/?action=stream"
+REFUSED = "refused"
 
 
 def _run(coro):
@@ -125,7 +126,7 @@ class TestCC2FrameFetch:
             cam = _cc2_camera(_make_client())
             session = _FakeSession([_FakeResponse(body=b"junk" + JPEG)])
             with _patch_session(session):
-                image, retryable = await cam._fetch_frame_once(STREAM_URL)
+                image, retryable, _err = await cam._fetch_frame_once(STREAM_URL)
             assert image == JPEG
             assert retryable is False
             assert session.calls == [STREAM_URL]
@@ -142,7 +143,7 @@ class TestCC2FrameFetch:
                 _patch_session(session),
                 patch.object(camera_module.LOGGER, "warning") as warn,
             ):
-                image, retryable = await cam._fetch_frame_once(STREAM_URL)
+                image, retryable, _err = await cam._fetch_frame_once(STREAM_URL)
             assert image is None
             # A reply that arrived is never retried - it would cost a slot.
             assert retryable is False
@@ -161,7 +162,7 @@ class TestCC2FrameFetch:
                 _patch_session(session),
                 patch.object(camera_module.LOGGER, "warning") as warn,
             ):
-                image, retryable = await cam._fetch_frame_once(STREAM_URL)
+                image, retryable, _err = await cam._fetch_frame_once(STREAM_URL)
             assert image is None
             assert retryable is False
             assert "no JPEG frame" in warn.call_args[0][0]
@@ -178,7 +179,7 @@ class TestCC2FrameFetch:
                 _patch_session(session),
                 patch.object(camera_module.LOGGER, "debug") as debug,
             ):
-                image, retryable = await cam._fetch_frame_once(STREAM_URL)
+                image, retryable, _err = await cam._fetch_frame_once(STREAM_URL)
             assert image is None
             assert retryable is True
             assert "connection refused" in str(debug.call_args)
@@ -261,15 +262,23 @@ class TestGrabRetry:
 
         async def run() -> None:
             cam = _cc2_camera(_make_client())
-            session = _FakeSession([OSError("refused")] * 100)
+            session = _FakeSession([OSError("connection refused")] * 100)
             with (
                 _patch_session(session),
                 patch.object(camera_module, "FRAME_RETRY_TIMEOUT", 0),
+                patch.object(cam, "_probe_camera_ports", AsyncMock()) as probe,
                 patch.object(camera_module.LOGGER, "warning") as warn,
             ):
                 image = await cam._grab_frame(STREAM_URL, allow_retry=True)
             assert image is None
-            assert "never accepted a connection" in warn.call_args[0][0]
+            message = warn.call_args[0][0]
+            assert "never accepted a connection" in message
+            # The actual transport error must reach the warning, not just DEBUG.
+            assert "last error: %s" in message
+            assert "connection refused" in str(warn.call_args)
+            # The printer's own camera_status is reported too.
+            assert "camera_status=%s" in message
+            probe.assert_awaited_once()
 
         _run(run())
 
@@ -417,7 +426,7 @@ class TestCC2CameraImage:
             order: list[str] = []
             original = cam._fetch_frame_once
 
-            async def tracked(url: str) -> tuple[bytes | None, bool]:
+            async def tracked(url: str) -> tuple[bytes | None, bool, str | None]:
                 order.append("start")
                 await asyncio.sleep(0)
                 order.append("end")
@@ -450,6 +459,75 @@ class TestCC2CameraImage:
             assert image == JPEG
             assert len(session.calls) == 1
             cam._cancel_pending_disable()
+
+        _run(run())
+
+
+class TestUnreachableCameraDiagnostics:
+    """What gets reported when nothing accepts the connection."""
+
+    def test_port_probe_reports_open_and_closed_ports(self) -> None:
+        """The probe says which ports listen, using bare TCP connects."""
+
+        async def run() -> None:
+            client = _make_client()
+            cam = _cc2_camera(client)
+
+            async def fake_open(_host: str, port: int):
+                if port != 8081:
+                    raise ConnectionRefusedError(REFUSED)
+                writer = MagicMock()
+                writer.close = MagicMock()
+                writer.wait_closed = AsyncMock()
+                return MagicMock(), writer
+
+            with (
+                patch.object(camera_module.asyncio, "open_connection", fake_open),
+                patch.object(camera_module.LOGGER, "warning") as warn,
+            ):
+                await cam._probe_camera_ports(STREAM_URL)
+
+            message = str(warn.call_args)
+            assert "8081: open" in message
+            assert "8080: ConnectionRefusedError" in message
+
+        _run(run())
+
+    def test_port_probe_runs_once_per_entity(self) -> None:
+        """The probe does not repeat on every failed snapshot."""
+
+        async def run() -> None:
+            cam = _cc2_camera(_make_client())
+
+            async def fake_open(_host: str, _port: int):
+                raise ConnectionRefusedError(REFUSED)
+
+            with (
+                patch.object(camera_module.asyncio, "open_connection", fake_open),
+                patch.object(camera_module.LOGGER, "warning") as warn,
+            ):
+                await cam._probe_camera_ports(STREAM_URL)
+                await cam._probe_camera_ports(STREAM_URL)
+            assert warn.call_count == 1
+
+        _run(run())
+
+    def test_camera_status_disconnected_is_surfaced(self) -> None:
+        """A printer reporting no camera attached says so in the warning."""
+
+        async def run() -> None:
+            client = _make_client()
+            client.printer_data.attributes.camera_status = 0
+            cam = _cc2_camera(client)
+            with (
+                patch.object(cam, "_probe_camera_ports", AsyncMock()),
+                patch.object(camera_module.LOGGER, "warning") as warn,
+            ):
+                await cam._report_unreachable_camera(STREAM_URL, 8, "refused")
+            # args: (format, entity_id, url, timeout, attempts,
+            #        last_error, camera_status, num_connected, max_allowed)
+            assert warn.call_args[0][5] == "refused"
+            assert warn.call_args[0][6] == 0
 
         _run(run())
 

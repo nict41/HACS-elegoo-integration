@@ -22,6 +22,7 @@ from homeassistant.helpers.aiohttp_client import (
 )
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from propcache.api import cached_property
+from yarl import URL
 
 from custom_components.elegoo_printer.const import (
     CONF_CAMERA_ENABLED,
@@ -74,6 +75,13 @@ FRAME_FETCH_MAX_BYTES = 4 * 1024 * 1024  # give up rather than read a stream for
 BUFFER_SIZE = 102400  # matches homeassistant.components.mjpeg.camera
 DISABLE_DEBOUNCE_DELAY = 5.0  # keep video on briefly so back-to-back grabs reuse it
 GRAB_FAILURE_LOG_INTERVAL = 300.0  # seconds between repeated grab-failure warnings
+
+# Ports probed once, at WARNING, when the camera refuses the connection
+# outright. A refused connection consumes no video slot, so this is safe
+# in exactly the case it runs in - unlike an HTTP request, which would.
+# The probe is a bare TCP connect that is closed immediately; it sends no
+# HTTP request, so it does not register as a viewer.
+CC2_CAMERA_PORT_CANDIDATES = (8080, 8081, 80, 8000, 8888, 554, 8554)
 
 
 class ElegooCameraMjpeg(CameraMjpeg):
@@ -174,6 +182,7 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         self._pending_disable_task: asyncio.Task | None = None
         self._last_grab_failure_log = 0.0
         self._stale_slot_released = False
+        self._ports_probed = False
 
     def _log_grab_failure(self, reason: str, *args: object) -> None:
         """
@@ -749,7 +758,9 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
             self._stream_enabled = False
             self._mjpeg_url = None
 
-    async def _fetch_frame_once(self, url: str) -> tuple[bytes | None, bool]:
+    async def _fetch_frame_once(
+        self, url: str
+    ) -> tuple[bytes | None, bool, str | None]:
         """
         Pull one JPEG frame over a single short-lived connection.
 
@@ -760,11 +771,12 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         instead of a silent None.
 
         Returns:
-            (frame, retryable). `retryable` is True only for connection
-            errors — the case where the printer has not finished bringing
-            its camera server up. A reply that arrived is never retried,
-            because a retry would spend another connection slot for
-            nothing.
+            (frame, retryable, error). `retryable` is True only for
+            connection errors — the case where the printer has not
+            finished bringing its camera server up. A reply that arrived
+            is never retried, because a retry would spend another
+            connection slot for nothing. `error` describes the transport
+            failure so the caller can report it.
 
         """
         session = async_get_clientsession(self.hass)
@@ -778,7 +790,7 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                         resp.status,
                         content_type,
                     )
-                    return None, False
+                    return None, False, None
 
                 LOGGER.debug(
                     "Reading frame for %s from %s (HTTP %d, %s)",
@@ -793,7 +805,7 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                     jpg_end = data.find(b"\xff\xd9")
                     jpg_start = data.find(b"\xff\xd8")
                     if jpg_end != -1 and jpg_start != -1 and jpg_start < jpg_end:
-                        return data[jpg_start : jpg_end + 2], False
+                        return data[jpg_start : jpg_end + 2], False, None
                     if len(data) > FRAME_FETCH_MAX_BYTES:
                         break
 
@@ -803,14 +815,14 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                     url,
                     content_type,
                 )
-                return None, False
+                return None, False, None
         except TimeoutError:
             self._log_grab_failure(
                 "timed out after %.0fs reading a frame from %s",
                 FRAME_FETCH_TIMEOUT,
                 url,
             )
-            return None, False
+            return None, False, None
         except (aiohttp.ClientError, OSError) as err:
             # Could not get a reply at all — the camera server may still be
             # coming up after the enable acknowledgement.
@@ -821,7 +833,7 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                 type(err).__name__,
                 err,
             )
-            return None, True
+            return None, True, f"{type(err).__name__}: {err}"
 
     async def _grab_frame(self, url: str, *, allow_retry: bool) -> bytes | None:
         """
@@ -836,10 +848,11 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         deadline = loop.time() + FRAME_RETRY_TIMEOUT
         delay = FRAME_RETRY_INITIAL_DELAY
         attempts = 0
+        last_error = "none"
 
         while True:
             attempts += 1
-            image, retryable = await self._fetch_frame_once(url)
+            image, retryable, error = await self._fetch_frame_once(url)
             if image is not None:
                 if attempts > 1:
                     LOGGER.debug(
@@ -849,21 +862,90 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                         attempts,
                     )
                 return image
+            if error is not None:
+                last_error = error
             if not (retryable and allow_retry):
                 return None
 
             remaining = deadline - loop.time()
             if remaining <= 0:
-                self._log_grab_failure(
-                    "camera server at %s never accepted a connection "
-                    "within %.1fs (%d attempts)",
-                    url,
-                    FRAME_RETRY_TIMEOUT,
-                    attempts,
-                )
+                await self._report_unreachable_camera(url, attempts, last_error)
                 return None
             await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, FRAME_RETRY_MAX_DELAY)
+
+    async def _report_unreachable_camera(
+        self, url: str, attempts: int, last_error: str
+    ) -> None:
+        """
+        Report a camera that never accepted a connection, and probe ports.
+
+        The printer's own view of the camera is included: camera_status 0
+        means the printer itself says no camera is attached, which no
+        amount of retrying will fix.
+        """
+        attrs = self._printer_client.printer_data.attributes
+        camera_status = getattr(attrs, "camera_status", None)
+        num_connected, max_allowed = self._capacity_counters()
+        self._log_grab_failure(
+            "camera server at %s never accepted a connection within %.1fs "
+            "(%d attempts, last error: %s). Printer reports "
+            "camera_status=%s (0=disconnected, 1=connected), "
+            "num_video_stream_connected=%d, max_video_stream_allowed=%d",
+            url,
+            FRAME_RETRY_TIMEOUT,
+            attempts,
+            last_error,
+            camera_status,
+            num_connected,
+            max_allowed,
+        )
+        await self._probe_camera_ports(url)
+
+    async def _probe_camera_ports(self, url: str) -> None:
+        """
+        Log which ports on the printer accept a TCP connection, once.
+
+        Only ever reached when the configured port refused the
+        connection, which establishes that a refused connection costs no
+        video slot. Each probe is a bare TCP connect closed immediately -
+        no HTTP request is sent, so nothing registers as a viewer.
+
+        The :8080 stream URL is an assumption inherited from upstream and
+        has never been verified against CC2 firmware; this is what tells
+        us whether the camera is simply on a different port.
+        """
+        if self._ports_probed:
+            return
+        self._ports_probed = True
+
+        host = URL(url).host
+        if not host:
+            return
+
+        results: list[str] = []
+        for port in CC2_CAMERA_PORT_CANDIDATES:
+            writer = None
+            try:
+                async with asyncio.timeout(2):
+                    _reader, writer = await asyncio.open_connection(host, port)
+                results.append(f"{port}: open")
+            except TimeoutError:
+                results.append(f"{port}: timeout")
+            except OSError as err:
+                results.append(f"{port}: {type(err).__name__}")
+            finally:
+                if writer is not None:
+                    writer.close()
+                    with contextlib.suppress(Exception):
+                        await writer.wait_closed()
+
+        LOGGER.warning(
+            "CC2 camera port probe for %s on %s: %s",
+            self.entity_id,
+            host,
+            ", ".join(results),
+        )
 
     async def _async_cc2_camera_image(
         self, width: int | None, height: int | None
