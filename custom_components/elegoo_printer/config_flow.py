@@ -27,6 +27,7 @@ from .cc2.gcode_proxy import GCodeProxyClient
 from .const import (
     CONF_CAMERA_ENABLED,
     CONF_CC2_ACCESS_CODE,
+    CONF_CC2_CAMERA_PASSIVE,
     CONF_EXTERNAL_IP,
     CONF_GCODE_PROXY_URL,
     CONF_HAS_CANVAS,
@@ -1158,6 +1159,10 @@ class ElegooOptionsFlowHandler(config_entries.OptionsFlow):
             if access_code:
                 printer_data[CONF_CC2_ACCESS_CODE] = access_code
 
+            printer_data[CONF_CC2_CAMERA_PASSIVE] = bool(
+                user_input.get(CONF_CC2_CAMERA_PASSIVE, False)
+            )
+
             proxy_url, proxy_error = await self._async_validate_gcode_proxy(
                 user_input.get(CONF_GCODE_PROXY_URL)
             )
@@ -1201,6 +1206,9 @@ class ElegooOptionsFlowHandler(config_entries.OptionsFlow):
             vol.Optional(CONF_CC2_ACCESS_CODE): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD),
             ),
+            vol.Optional(
+                CONF_CC2_CAMERA_PASSIVE, default=False
+            ): selector.BooleanSelector(),
             vol.Optional(CONF_GCODE_PROXY_URL, default=""): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT),
             ),
