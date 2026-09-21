@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import secrets
 import time
@@ -127,6 +128,15 @@ class ElegooCC2Client:
         self._video_command_count = 0
         self._raw_attrs_logged = False
 
+        # MQTT session telemetry. The printer registers clients statefully and
+        # caps how many it will hold, so how often this integration connects,
+        # registers and drops is the thing to watch.
+        self._connect_count = 0
+        self._register_count = 0
+        self._disconnect_count = 0
+        self._session_started: float | None = None
+        self._last_disconnect_reason = "n/a"
+
         # MQTT client state
         self.mqtt_client: aiomqtt.Client | None = None
         self._is_connected: bool = False
@@ -154,12 +164,23 @@ class ElegooCC2Client:
         self._request_counter = 0
 
         # Client identification - match web interface format
-        # Format: "0cli" + timestamp_hex + random_hex, truncated to exactly 10 chars
-        # Web interface: w7e() function from elegoo-fdm-web/src/14-app-helpers.js
-        # JavaScript equivalent: concatenate prefix/timestamp/random then slice to 10
-        timestamp_hex = format(int(time.time() * 1000), "x")[-5:]  # Last 5 hex chars
-        random_hex = format(secrets.randbelow(4096), "x")  # Random hex (0-fff)
-        self._client_id = f"0cli{timestamp_hex}{random_hex}"[:10]  # Truncate to 10
+        # Format: "0cli" + 6 hex chars, exactly 10 chars, as the web interface
+        # produces (w7e() in elegoo-fdm-web/src/14-app-helpers.js).
+        #
+        # The web interface derives those 6 chars from a timestamp plus random
+        # bytes, so every page load is a new identity. We derive them from the
+        # printer serial instead, which keeps the format but makes the identity
+        # STABLE across Home Assistant restarts, reloads and reconnects.
+        #
+        # Why: the client id appears in every MQTT topic
+        # (elegoo/{serial}/{client_id}/api_request) and the printer registers
+        # each client statefully. A fresh identity per restart means the
+        # printer accumulates registrations it may never free, and it has a
+        # small client cap. Reconnecting under one stable identity lets the
+        # broker displace the previous session instead of adding to it.
+        identity_seed = (self.serial_number or self.printer_ip or "unknown").encode()
+        stable_hex = hashlib.sha256(identity_seed).hexdigest()[:6]
+        self._client_id = f"0cli{stable_hex}"
 
         # Registration request ID - match web interface format
         # Format: UUID-like string + timestamp in hex
@@ -375,7 +396,16 @@ class ElegooCC2Client:
 
             self.mqtt_client = aiomqtt.Client(**client_kwargs)
             await self.mqtt_client.__aenter__()
-            self.logger.debug("MQTT connection established successfully")
+            self._connect_count += 1
+            self._session_started = time.time()
+            self.logger.info(
+                "CC2MQTT connected #%d (client_id=%s, keepalive=%ds, "
+                "previous disconnect: %s)",
+                self._connect_count,
+                self._client_id,
+                CC2_MQTT_KEEPALIVE,
+                self._last_disconnect_reason,
+            )
 
             # Subscribe to topics before registration
             await self._subscribe_to_topics()
@@ -394,6 +424,14 @@ class ElegooCC2Client:
                 return False
 
             self._is_registered = True
+            self._register_count += 1
+            self.logger.info(
+                "CC2MQTT registered #%d with printer (client_id=%s). The printer "
+                "holds registrations statefully, so this count is how many "
+                "times it has been asked to register this client.",
+                self._register_count,
+                self._client_id,
+            )
 
             # Cancel any pending disconnect delay (reconnect succeeded)
             if self._disconnect_delay_task is not None:
@@ -420,12 +458,36 @@ class ElegooCC2Client:
 
         return False
 
-    async def disconnect(self) -> None:
-        """Disconnect from the CC2 printer."""
+    async def disconnect(self, reason: str = "requested") -> None:
+        """
+        Disconnect from the CC2 printer.
+
+        Arguments:
+            reason: Why the disconnect happened, for the session log.
+
+        """
         # Increment generation to invalidate any in-flight callbacks
         self._connection_generation += 1
 
-        self.logger.info("Closing CC2 connection to printer")
+        self._disconnect_count += 1
+        self._last_disconnect_reason = reason
+        uptime = (
+            time.time() - self._session_started
+            if self._session_started is not None
+            else 0.0
+        )
+        self._session_started = None
+        self.logger.info(
+            "CC2MQTT disconnecting #%d after %.0fs connected (reason: %s). "
+            "Session totals: connects=%d, registrations=%d, "
+            "video commands=%d",
+            self._disconnect_count,
+            uptime,
+            reason,
+            self._connect_count,
+            self._register_count,
+            self._video_command_count,
+        )
 
         # Cancel any pending disconnect delay
         if self._disconnect_delay_task is not None:
@@ -615,7 +677,12 @@ class ElegooCC2Client:
                     self._is_connected = False
                     self._is_registered = False
                     # Schedule proper cleanup in background
-                    task = asyncio.create_task(self.disconnect())
+                    task = asyncio.create_task(
+                        self.disconnect(
+                            reason=f"heartbeat timeout, no PONG in "
+                            f"{int(time_since_pong)}s"
+                        )
+                    )
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
                     break
@@ -632,7 +699,9 @@ class ElegooCC2Client:
                 self.logger.warning("Heartbeat error: %s", e)
                 self._is_connected = False
                 self._is_registered = False
-                task = asyncio.create_task(self.disconnect())
+                task = asyncio.create_task(
+                    self.disconnect(reason=f"heartbeat error: {type(e).__name__}: {e}")
+                )
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
                 break
@@ -1428,6 +1497,20 @@ class ElegooCC2Client:
     async def get_printer_attributes(self) -> PrinterData:
         """Return the printer attributes."""
         return self.printer_data
+
+    def mqtt_session_stats(self) -> str:
+        """Summarise the MQTT session for correlation with camera logs."""
+        uptime = (
+            time.time() - self._session_started
+            if self._session_started is not None
+            else 0.0
+        )
+        return (
+            f"connects={self._connect_count}, registrations={self._register_count}, "
+            f"disconnects={self._disconnect_count}, uptime={uptime:.0f}s, "
+            f"video_commands={self._video_command_count}, "
+            f"last_disconnect={self._last_disconnect_reason}"
+        )
 
     async def set_printer_video_stream(self, *, enable: bool) -> None:
         """Enable or disable the printer's video stream."""
