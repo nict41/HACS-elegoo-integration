@@ -1,9 +1,19 @@
 name: "Validate"
 
+# Upstream also ran this on a daily schedule and included HACS validation.
+# Both are dropped in this private copy:
+#
+# - HACS validation checks what a PUBLISHED HACS repository needs (repo
+#   description, topics, brands registration). This copy is installed as a
+#   custom repository, so those checks can never pass and the job failed on
+#   every run.
+# - The daily cron therefore produced a failure email every morning for a
+#   result that was never going to change.
+#
+# Hassfest is kept: it validates manifest.json and passes, and it is worth
+# running when the code actually changes.
 on:
   workflow_dispatch:
-  schedule:
-    - cron:  "0 0 * * *"
   push:
     branches:
       - "main"
@@ -21,15 +31,3 @@ jobs:
 
         - name: "Run hassfest validation"
           uses: "home-assistant/actions/hassfest@master"
-
-  hacs: # https://github.com/hacs/action
-    name: "HACS Validation"
-    runs-on: "ubuntu-latest"
-    steps:
-        - name: "Checkout the repository"
-          uses: "actions/checkout@v7"
-
-        - name: "Run HACS validation"
-          uses: "hacs/action@main"
-          with:
-            category: "integration"
