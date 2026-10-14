@@ -219,16 +219,22 @@ class TestPassiveMode:
 
         _run(run())
 
-    def test_snapshot_sends_nothing_to_the_printer(self) -> None:
-        """A whole snapshot cycle issues zero video commands."""
+    def test_hub_prepare_sends_nothing_to_the_printer(self) -> None:
+        """
+        The frame hub's only command path issues zero video commands.
+
+        _cc2_hub_prepare is where the hub would send its one ENABLE per
+        backoff step; in passive mode it must hand back the URL and send
+        nothing, even after a failure. The full hub cycle in passive mode
+        is covered end to end in test_cc2_frame_hub.py.
+        """
 
         async def run() -> None:
             cam = _camera(passive=True)
-            with patch.object(
-                cam, "_grab_frame", AsyncMock(return_value=b"\xff\xd8\xff\xd9")
-            ):
-                image = await cam.async_camera_image()
-            assert image is not None
+            assert await cam._cc2_hub_prepare(after_failure=False) == STREAM_URL
+            assert await cam._cc2_hub_prepare(after_failure=True) == STREAM_URL
+            cam._cc2_hub_stopped()
+            await cam._disable_stream()
             cam._printer_client.get_printer_video.assert_not_called()
             cam._printer_client.set_printer_video_stream.assert_not_called()
             cam._cancel_pending_disable()
@@ -275,7 +281,13 @@ class TestPortProbeRearm:
 
 
 class TestPerGrabSummary:
-    """One INFO line per snapshot, readable without debug logging."""
+    """One DEBUG line per snapshot; the hub's INFO lines carry the printer side."""
+
+    @staticmethod
+    def _patch_snapshot(cam, value) -> contextlib.AbstractContextManager:
+        return patch.object(
+            cam._get_frame_hub(), "async_snapshot", AsyncMock(return_value=value)
+        )
 
     def test_successful_grab_logs_result_and_size(self) -> None:
         """A good grab reports ok, its size and a sequence number."""
@@ -284,15 +296,14 @@ class TestPerGrabSummary:
             cam = _camera(passive=True)
             frame = b"\xff\xd8payload\xff\xd9"
             with (
-                patch.object(cam, "_grab_frame", AsyncMock(return_value=frame)),
-                patch.object(camera_module.LOGGER, "info") as info,
+                self._patch_snapshot(cam, frame),
+                patch.object(camera_module.LOGGER, "debug") as debug,
             ):
                 await cam.async_camera_image()
-            line = next(c for c in info.call_args_list if "grab #%d" in c[0][0])
+            line = next(c for c in debug.call_args_list if "grab #%d" in c[0][0])
             assert line[0][1] == 1  # sequence
             assert line[0][3] == "ok"
             assert line[0][4] == len(frame)
-            cam._cancel_pending_disable()
 
         _run(run())
 
@@ -302,18 +313,15 @@ class TestPerGrabSummary:
         async def run() -> None:
             cam = _camera(passive=True)
             with (
-                patch.object(cam, "_grab_frame", AsyncMock(return_value=None)),
-                patch.object(
-                    camera_module.MjpegCamera,
-                    "async_camera_image",
-                    AsyncMock(return_value=None),
-                ),
-                patch.object(camera_module.LOGGER, "info") as info,
+                self._patch_snapshot(cam, None),
+                patch.object(camera_module.LOGGER, "debug") as debug,
+                patch.object(camera_module.LOGGER, "warning") as warn,
             ):
                 await cam.async_camera_image()
-            line = next(c for c in info.call_args_list if "grab #%d" in c[0][0])
+            line = next(c for c in debug.call_args_list if "grab #%d" in c[0][0])
             assert line[0][3] == "failed"
-            cam._cancel_pending_disable()
+            assert "no fresh frame" in warn.call_args[0][0]
+            assert cam._stats["images_failed"] == 1
 
         _run(run())
 
@@ -323,16 +331,13 @@ class TestPerGrabSummary:
         async def run() -> None:
             cam = _camera(passive=True)
             with (
-                patch.object(
-                    cam, "_grab_frame", AsyncMock(return_value=b"\xff\xd8\xff\xd9")
-                ),
-                patch.object(camera_module.LOGGER, "info") as info,
+                self._patch_snapshot(cam, b"\xff\xd8\xff\xd9"),
+                patch.object(camera_module.LOGGER, "debug") as debug,
             ):
                 await cam.async_camera_image()
                 await cam.async_camera_image()
-            seqs = [c[0][1] for c in info.call_args_list if "grab #%d" in c[0][0]]
+            seqs = [c[0][1] for c in debug.call_args_list if "grab #%d" in c[0][0]]
             assert seqs == [1, 2]
-            cam._cancel_pending_disable()
 
         _run(run())
 

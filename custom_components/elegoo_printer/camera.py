@@ -2,10 +2,10 @@
 
 import asyncio
 import contextlib
+import math
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
-import aiohttp
 from aiohttp import web
 from haffmpeg.camera import CameraMjpeg
 from homeassistant.components.camera import Camera, CameraEntityFeature
@@ -18,12 +18,12 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.helpers.aiohttp_client import (
     async_aiohttp_proxy_stream,
-    async_get_clientsession,
 )
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from propcache.api import cached_property
 from yarl import URL
 
+from custom_components.elegoo_printer.cc2.frame_hub import LOG_MARKER, CC2FrameHub
 from custom_components.elegoo_printer.const import (
     CC2_VIDEO_PATH,
     CC2_VIDEO_PORT,
@@ -58,7 +58,7 @@ FFMPEG_TERMINATE_TIMEOUT = 5  # seconds to wait after SIGTERM before SIGKILL
 NATIVE_STREAM_IDLE_TIMEOUT = 600  # 10 minutes — clear native stream flag after idle
 IDLE_WATCHDOG_INTERVAL = 60  # seconds between idle checks
 
-# CC2 chamber camera snapshot tuning.
+# CC2 chamber camera tuning.
 #
 # Upstream's own research (docs/research/issue-414-cc2-proxy-connection.md)
 # records the CC2 camera on :8080 as "none, 1 viewer" — exactly one
@@ -66,16 +66,14 @@ IDLE_WATCHDOG_INTERVAL = 60  # seconds between idle checks
 # more than one at a time, because a slot the printer thinks is in use is
 # not obviously recoverable without power-cycling it.
 #
-# The printer also acknowledges the enable command (method 1042) before its
-# MJPEG server is necessarily accepting connections, so the frame grab
-# itself is retried rather than being preceded by a separate probe
-# connection.
-FRAME_FETCH_TIMEOUT = 10.0  # seconds for a single-frame grab
-FRAME_RETRY_TIMEOUT = 5.0  # total budget for connect retries after an enable
-FRAME_RETRY_INITIAL_DELAY = 0.2  # first backoff step
-FRAME_RETRY_MAX_DELAY = 1.0  # backoff ceiling
-FRAME_FETCH_MAX_BYTES = 4 * 1024 * 1024  # give up rather than read a stream forever
-BUFFER_SIZE = 102400  # matches homeassistant.components.mjpeg.camera
+# All CC2 frames come from one CC2FrameHub per camera (cc2/frame_hub.py),
+# which holds the only connection to the printer and fans frames out to
+# snapshots and live viewers alike.
+FRAME_FETCH_TIMEOUT = 10.0  # how long a snapshot waits for the hub's first frame
+CC2_STREAM_FPS_MIN = 1.0  # per-viewer ?fps= cap, lower clamp
+CC2_STREAM_FPS_MAX = 20.0  # per-viewer ?fps= cap, upper clamp
+CC2_STREAM_WAIT = 1.0  # a viewer re-checks its client this often while no frame comes
+CC2_MJPEG_BOUNDARY = "frame"
 DISABLE_DEBOUNCE_DELAY = 5.0  # keep video on briefly so back-to-back grabs reuse it
 GRAB_FAILURE_LOG_INTERVAL = 300.0  # seconds between repeated grab-failure warnings
 
@@ -88,10 +86,6 @@ CC2_CAMERA_PORT_CANDIDATES = (8080, 8081, 80, 8000, 8888, 554, 8554)
 PORT_PROBE_INTERVAL = 1800.0  # re-probe at most every 30 min, not once ever
 CAMERA_PORT_POLL_INTERVAL = 60.0  # how often to check whether the camera listens
 CAMERA_STATS_INTERVAL = 600.0  # seconds between camera activity summaries
-
-# Every CC2 camera diagnostic line carries this marker so a whole session's
-# timeline can be pulled out of a Home Assistant log with one grep.
-LOG_MARKER = "CC2CAM"
 
 
 class ElegooCameraMjpeg(CameraMjpeg):
@@ -194,6 +188,9 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         self._stale_slot_released = False
         self._last_port_probe = 0.0
         self._cc2_passive = False
+        # CC2 only, created on first use. While it runs it counts as one
+        # viewer, so the debounce and the idle watchdog leave video enabled.
+        self._frame_hub: CC2FrameHub | None = None
         # Activity ledger. Summarised periodically so a camera that degrades
         # over hours leaves a timeline of what this integration actually did,
         # rather than only the moment it finally failed.
@@ -211,7 +208,6 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         )
         self._stats_last_logged: float | None = None
         self._grab_seq = 0
-        self._grab_stream_was_enabled = False
         self._camera_port_task: asyncio.Task | None = None
         self._camera_port_open: bool | None = None
 
@@ -345,10 +341,11 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         # timestamp across two log sources.
         stats_fn = getattr(self._printer_client, "mqtt_session_stats", None)
         mqtt_stats = stats_fn() if callable(stats_fn) else "n/a"
+        hub = self._frame_hub
         LOGGER.info(
             LOG_MARKER + " activity for %s: %s | printer now reports "
             "%d/%d video slots in use, camera_status=%s, stream_enabled=%s, "
-            "passive=%s | mqtt: %s",
+            "passive=%s | mqtt: %s | hub: %s",
             self.entity_id,
             ", ".join(f"{k}={v}" for k, v in self._stats.items()),
             num_connected,
@@ -357,6 +354,7 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
             self._stream_enabled,
             self._cc2_passive,
             mqtt_stats,
+            hub.describe() if hub is not None else "n/a",
         )
 
     async def _release_stale_stream(self) -> bool:
@@ -438,6 +436,7 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
             self._active_mjpeg_streams > 0
             or self._transient_viewers > 0
             or self._native_stream_active
+            or (self._frame_hub is not None and self._frame_hub.is_running)
         )
 
     async def _ensure_stream_enabled(self) -> None:
@@ -569,8 +568,16 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Idle watchdog error for %s", self.entity_id)
 
+    async def _stop_frame_hub(self, reason: str) -> None:
+        """Stop the CC2 frame hub for good, closing its printer connection."""
+        if self._frame_hub is not None:
+            await self._frame_hub.async_stop(reason, final=True)
+
     async def _cleanup_video_lifecycle(self) -> None:
         """Cancel the idle watchdog and release the video stream state."""
+        # Close the hub's connection before the disable below. Done first so
+        # a disable it schedules on the way out is cancelled with the rest.
+        await self._stop_frame_hub("entity removed")
         # Drop any debounced disable — the explicit _disable_stream() below
         # supersedes it. Awaited so the task cannot outlive the entity and
         # fire a disable against a client that is being torn down.
@@ -619,6 +626,7 @@ class ElegooVideoStreamLifecycle(ElegooPrinterEntity):
         async_will_remove_from_hass does not run on every shutdown path,
         and an enabled stream survives the restart on the printer side.
         """
+        await self._stop_frame_hub("Home Assistant stopping")
         self._cancel_pending_disable()
         await self._disable_stream()
 
@@ -952,129 +960,81 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
             self._stream_enabled = False
             self._mjpeg_url = None
 
-    async def _fetch_frame_once(
-        self, url: str
-    ) -> tuple[bytes | None, bool, str | None]:
-        """
-        Pull one JPEG frame over a single short-lived connection.
+    def _get_frame_hub(self) -> CC2FrameHub:
+        """Return this camera's frame hub, creating it on first use."""
+        if self._frame_hub is None:
+            self._frame_hub = CC2FrameHub(
+                self.hass,
+                self.entity_id,
+                prepare=self._cc2_hub_prepare,
+                on_stopped=self._cc2_hub_stopped,
+                on_unreachable=self._report_unreachable_camera,
+            )
+        return self._frame_hub
 
-        The CC2 camera allows one viewer, so this opens exactly one
-        connection, reads until it has a whole frame, and closes. Unlike
-        Home Assistant's MjpegCamera image path this checks the HTTP
-        status and logs it, so a wrong URL shows up as a real message
-        instead of a silent None.
+    async def _cc2_hub_prepare(self, *, after_failure: bool) -> str | None:
+        """
+        Get the printer ready for the hub's next connection attempt.
+
+        The hub calls this once when it starts and once per backoff step,
+        so it is the only place the hub can cause a video ENABLE, and it
+        causes at most one per call. Serialized with the debounced disable
+        on _stream_lock so an enable and a disable never interleave.
 
         Returns:
-            (frame, retryable, error). `retryable` is True only for
-            connection errors — the case where the printer has not
-            finished bringing its camera server up. A reply that arrived
-            is never retried, because a retry would spend another
-            connection slot for nothing. `error` describes the transport
-            failure so the caller can report it.
+            The stream URL, or None if no connection should be attempted
+            this step (no URL, or the printer says its slot is taken).
 
         """
-        session = async_get_clientsession(self.hass)
-        try:
-            async with asyncio.timeout(FRAME_FETCH_TIMEOUT), session.get(url) as resp:
-                content_type = resp.headers.get("Content-Type", "no content-type")
-                if resp.status != HTTPStatus.OK:
-                    self._log_grab_failure(
-                        "stream URL %s returned HTTP %d (%s)",
-                        url,
-                        resp.status,
-                        content_type,
-                    )
-                    return None, False, None
-
-                LOGGER.debug(
-                    "Reading frame for %s from %s (HTTP %d, %s)",
-                    self.entity_id,
-                    url,
-                    resp.status,
-                    content_type,
-                )
-                data = b""
-                async for chunk in resp.content.iter_chunked(BUFFER_SIZE):
-                    data += chunk
-                    jpg_end = data.find(b"\xff\xd9")
-                    jpg_start = data.find(b"\xff\xd8")
-                    if jpg_end != -1 and jpg_start != -1 and jpg_start < jpg_end:
-                        return data[jpg_start : jpg_end + 2], False, None
-                    if len(data) > FRAME_FETCH_MAX_BYTES:
-                        break
-
+        async with self._stream_lock:
+            self._cancel_pending_disable()
+            was_enabled = self._stream_enabled
+            if after_failure and not self._cc2_passive:
+                # The last connection failed or dropped, so the printer may
+                # have turned its camera server off: allow this step's one
+                # ENABLE. _update_stream_url skips it while the flag is set.
+                self._stream_enabled = False
+            try:
+                await self._update_stream_url()
+            finally:
+                # If no enable went out (or its outcome is unknown) keep
+                # treating video as on, so a disable still follows later.
+                self._stream_enabled = self._stream_enabled or was_enabled
+            if self._is_over_capacity():
+                # The hub holds no connection here, so a full slot belongs
+                # to someone else (or is still being released). Do not pile
+                # onto it; the hub backs off and asks again.
+                num_connected, max_allowed = self._capacity_counters()
                 self._log_grab_failure(
-                    "no JPEG frame in %d bytes from %s (%s)",
-                    len(data),
-                    url,
-                    content_type,
+                    "printer reports video capacity exhausted "
+                    "(num_video_stream_connected=%d, "
+                    "max_video_stream_allowed=%d)",
+                    num_connected,
+                    max_allowed,
                 )
-                return None, False, None
-        except TimeoutError:
-            self._log_grab_failure(
-                "timed out after %.0fs reading a frame from %s",
-                FRAME_FETCH_TIMEOUT,
-                url,
-            )
-            return None, False, None
-        except (aiohttp.ClientError, OSError) as err:
-            # Could not get a reply at all — the camera server may still be
-            # coming up after the enable acknowledgement.
-            LOGGER.debug(
-                "Frame grab for %s could not reach %s - %s: %s",
-                self.entity_id,
-                url,
-                type(err).__name__,
-                err,
-            )
-            return None, True, f"{type(err).__name__}: {err}"
-
-    async def _grab_frame(self, url: str, *, allow_retry: bool) -> bytes | None:
-        """
-        Grab a frame, retrying only while the camera server refuses to answer.
-
-        One connection is in flight at any moment. Retries are bounded by
-        FRAME_RETRY_TIMEOUT and only happen when the stream was just
-        enabled, which is the window where the printer has acknowledged
-        the enable but is not listening yet.
-        """
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + FRAME_RETRY_TIMEOUT
-        delay = FRAME_RETRY_INITIAL_DELAY
-        attempts = 0
-        last_error = "none"
-
-        while True:
-            attempts += 1
-            image, retryable, error = await self._fetch_frame_once(url)
-            if image is not None:
-                if attempts > 1:
-                    LOGGER.debug(
-                        "Frame grab for %s succeeded on attempt %d "
-                        "(camera server needed time after the enable)",
-                        self.entity_id,
-                        attempts,
-                    )
-                return image
-            if error is not None:
-                last_error = error
-            if not (retryable and allow_retry):
                 return None
-
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                await self._report_unreachable_camera(url, attempts, last_error)
+            if not self._mjpeg_url:
+                self._log_grab_failure(
+                    "no stream URL (printer connected=%s)",
+                    self._printer_client.is_connected,
+                )
                 return None
-            await asyncio.sleep(min(delay, remaining))
-            delay = min(delay * 2, FRAME_RETRY_MAX_DELAY)
+            return self._mjpeg_url
+
+    def _cc2_hub_stopped(self) -> None:
+        """Release the hub's viewer slot through the usual debounced disable."""
+        if not self._has_active_viewers():
+            self._schedule_disable()
 
     async def _report_unreachable_camera(
         self, url: str, attempts: int, last_error: str
     ) -> None:
         """
-        Report a camera that never accepted a connection, and probe ports.
+        Report a camera the frame hub could not stream from, and probe ports.
 
-        The printer's own view of the camera is included: camera_status 0
+        Called once per failure streak, when the hub reaches
+        HUB_WARN_AFTER_FAILURES consecutive failed attempts. The printer's
+        own view of the camera is included: camera_status 0
         means the printer itself says no camera is attached, which no
         amount of retrying will fix.
         """
@@ -1082,12 +1042,11 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         camera_status = getattr(attrs, "camera_status", None)
         num_connected, max_allowed = self._capacity_counters()
         self._log_grab_failure(
-            "camera server at %s never accepted a connection within %.1fs "
-            "(%d attempts, last error: %s). Printer reports "
+            "camera server at %s did not stream after %d consecutive "
+            "attempts (last error: %s). Printer reports "
             "camera_status=%s (0=disconnected, 1=connected), "
             "num_video_stream_connected=%d, max_video_stream_allowed=%d",
             url,
-            FRAME_RETRY_TIMEOUT,
             attempts,
             last_error,
             camera_status,
@@ -1144,128 +1103,97 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
             ", ".join(results),
         )
 
-    async def _async_cc2_camera_image(
-        self, width: int | None, height: int | None
-    ) -> bytes | None:
+    async def _async_cc2_camera_image(self) -> bytes | None:
         """
-        Grab a still from a CC2 chamber camera.
+        Serve a CC2 still from the frame hub.
 
-        Serialized on _stream_lock so overlapping snapshot calls cannot
-        toggle the printer's video on and off underneath each other, and
-        the disable is debounced so consecutive grabs reuse one enabled
-        stream. At most one connection to the camera is open at a time.
+        Opens no connection of its own: the hub's single upstream
+        connection is the only one the printer sees, however often
+        snapshots are requested. A frame older than HUB_STALE_AFTER is
+        never returned; None is returned instead.
         """
-        async with self._stream_lock:
-            self._grab_seq += 1
-            seq = self._grab_seq
-            started = asyncio.get_running_loop().time()
-            slots_before = self._capacity_counters()
-            outcome = "error"
-            size = 0
-            try:
-                image = await self._run_cc2_grab(width, height)
-            except Exception as err:
-                outcome = f"exception:{type(err).__name__}"
-                raise
-            else:
-                if image is None:
-                    outcome = "failed"
-                else:
-                    outcome = "ok"
-                    size = len(image)
-                return image
-            finally:
-                # One line per snapshot, at INFO, so the whole cycle can be
-                # read without debug logging: what we did, what came back,
-                # and what the printer's slot count did across it.
-                attrs = self._printer_client.printer_data.attributes
-                LOGGER.info(
-                    LOG_MARKER + " grab #%d for %s: result=%s bytes=%d "
-                    "duration=%.2fs stream_was_enabled=%s passive=%s "
-                    "slots_before=%d/%d slots_after=%d/%d camera_status=%s",
-                    seq,
-                    self.entity_id,
-                    outcome,
-                    size,
-                    asyncio.get_running_loop().time() - started,
-                    self._grab_stream_was_enabled,
-                    self._cc2_passive,
-                    slots_before[0],
-                    slots_before[1],
-                    *self._capacity_counters(),
-                    getattr(attrs, "camera_status", None),
-                )
-
-    async def _run_cc2_grab(
-        self, width: int | None, height: int | None
-    ) -> bytes | None:
-        """Do the actual CC2 grab, wrapped by the per-cycle summary log."""
-        # A grab is starting: keep whatever stream is already up.
-        self._cancel_pending_disable()
-        # Retrying only pays off right after an enable, when the
-        # printer has acknowledged but may not be listening yet. A
-        # stream that was already up is listening by definition.
-        stream_was_enabled = self._stream_enabled
-        self._grab_stream_was_enabled = stream_was_enabled
-        if not self._has_active_viewers():
-            await self._update_stream_url()
-        self._transient_viewers += 1
-        try:
-            if not self._mjpeg_url:
-                self._log_grab_failure(
-                    "no stream URL (printer connected=%s)",
-                    self._printer_client.is_connected,
-                )
-                return None
-            if self._is_over_capacity():
-                num_connected, max_allowed = self._capacity_counters()
-                self._log_grab_failure(
-                    "printer reports video capacity exhausted "
-                    "(num_video_stream_connected=%d, "
-                    "max_video_stream_allowed=%d)",
-                    num_connected,
-                    max_allowed,
-                )
-                return None
-
-            url = self._mjpeg_url
-            image = await self._grab_frame(url, allow_retry=not stream_was_enabled)
-            if image is not None:
-                return image
-
-            # Fall back to Home Assistant's own MJPEG image path once
-            # before giving up — it uses httpx rather than aiohttp, so
-            # it can still succeed where the direct grab did not. It
-            # opens one connection, and the direct grab's is closed.
-            LOGGER.debug(
-                "Direct frame grab returned nothing for %s, "
-                "falling back to the MjpegCamera stream path",
-                self.entity_id,
+        self._grab_seq += 1
+        seq = self._grab_seq
+        hub = self._get_frame_hub()
+        started = asyncio.get_running_loop().time()
+        image = await hub.async_snapshot(FRAME_FETCH_TIMEOUT)
+        if image is None:
+            self._log_grab_failure(
+                "no fresh frame from the frame hub (%s)", hub.describe()
             )
-            try:
-                image = await super().async_camera_image(width=width, height=height)
-            except Exception as err:
-                # Logged for diagnosis, then re-raised: Home Assistant
-                # reports a failed snapshot on an exception but returns
-                # silently on None, so swallowing would hide the failure.
-                self._log_grab_failure(
-                    "MjpegCamera fallback raised %s: %s",
-                    type(err).__name__,
-                    err,
-                )
-                raise
-            if image is None:
-                self._log_grab_failure(
-                    "MjpegCamera fallback also returned no image from %s", url
-                )
-            return image
-        finally:
-            self._transient_viewers = max(0, self._transient_viewers - 1)
-            # Only disable if no other viewers are active. Debounced so a
-            # snapshot automation running every few seconds does not
-            # re-toggle the printer's video for every frame.
-            if not self._has_active_viewers():
-                self._schedule_disable()
+        LOGGER.debug(
+            LOG_MARKER + " grab #%d for %s: result=%s bytes=%d duration=%.2fs hub: %s",
+            seq,
+            self.entity_id,
+            "ok" if image is not None else "failed",
+            len(image) if image is not None else 0,
+            asyncio.get_running_loop().time() - started,
+            hub.describe(),
+        )
+        return image
+
+    @staticmethod
+    def _parse_fps(value: str | None) -> float | None:
+        """Parse a viewer's ?fps= cap, clamped; None means native rate."""
+        if not value:
+            return None
+        try:
+            fps = float(value)
+        except ValueError:
+            return None
+        if not math.isfinite(fps):
+            return None
+        return min(max(fps, CC2_STREAM_FPS_MIN), CC2_STREAM_FPS_MAX)
+
+    @staticmethod
+    def _client_gone(request: web.Request) -> bool:
+        transport = request.transport
+        return transport is None or transport.is_closing()
+
+    async def _handle_cc2_mjpeg_stream(
+        self, request: web.Request
+    ) -> web.StreamResponse:
+        """
+        Serve one live viewer from the frame hub.
+
+        Every viewer - the HA frontend, /api/camera_proxy_stream, external
+        apps - is a hub subscriber, never a connection to the printer. An
+        optional ?fps= query parameter (clamped to 1-20) caps this viewer's
+        frame rate; frames in between are skipped, never queued.
+        """
+        fps = self._parse_fps(request.query.get("fps"))
+        interval = 1.0 / fps if fps else 0.0
+        hub = self._get_frame_hub()
+        response = web.StreamResponse()
+        response.headers["Content-Type"] = (
+            f"multipart/x-mixed-replace;boundary={CC2_MJPEG_BOUNDARY}"
+        )
+        async with hub.async_subscribe():
+            await response.prepare(request)
+            last = 0
+            frame = hub.fresh_frame()
+            if frame is not None:
+                last = hub.frame_count
+            while True:
+                if frame is None:
+                    got = await hub.async_next_frame(last, CC2_STREAM_WAIT)
+                    if got is None:
+                        if self._client_gone(request):
+                            break
+                        continue
+                    last, frame = got
+                header = (
+                    f"--{CC2_MJPEG_BOUNDARY}\r\nContent-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(frame)}\r\n\r\n"
+                ).encode()
+                try:
+                    await response.write(header + frame + b"\r\n")
+                except ConnectionError:
+                    break
+                frame = None
+                if interval:
+                    await asyncio.sleep(interval)
+        return response
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
@@ -1280,12 +1208,12 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         frame from a short-lived HTTP connection, which closes when the
         grab completes, so no stream connection is left open afterwards.
 
-        CC2 printers take a separate path that waits for the stream
-        server to come up and reports why a grab failed.
+        CC2 printers are served from the frame hub instead, which holds
+        the only connection to the printer (see _async_cc2_camera_image).
         """
         self._stats["image_requests"] += 1
         if self._is_cc2:
-            image = await self._async_cc2_camera_image(width, height)
+            image = await self._async_cc2_camera_image()
             self._stats["images_ok" if image is not None else "images_failed"] += 1
             return image
 
@@ -1335,9 +1263,13 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         Generate an HTTP MJPEG stream from the camera.
 
         Ref-counted: enables video on first viewer, disables on last.
+        CC2 viewers are served from the frame hub instead of each opening
+        their own connection to the printer.
         """
-        # Enable stream if first viewer
         self._stats["stream_requests"] += 1
+        if self._is_cc2:
+            return await self._handle_cc2_mjpeg_stream(request)
+        # Enable stream if first viewer
         self._cancel_pending_disable()
         if not self._has_active_viewers():
             await self._update_stream_url()
@@ -1365,6 +1297,13 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         with FFmpeg), tracks the stream, and disables it after
         NATIVE_STREAM_IDLE_TIMEOUT of idle via the idle watchdog.
         """
+        if self._is_cc2:
+            # Deliberately no stream source on the CC2: HA's stream worker
+            # (ffmpeg) and go2rtc would each open their own connection to a
+            # camera that allows exactly one. Without a source, the frontend
+            # falls back to MJPEG via handle_async_mjpeg_stream, which the
+            # frame hub serves from its single connection.
+            return None
         if not self._native_stream_active:
             self._cancel_pending_disable()
             await self._update_stream_url()
