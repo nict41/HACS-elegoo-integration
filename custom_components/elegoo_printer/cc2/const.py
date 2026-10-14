@@ -95,6 +95,11 @@ CC2_ERROR_MD5_FAILED = 9004
 CC2_REG_OK = "ok"
 CC2_REG_FAIL = "fail"
 CC2_REG_TOO_MANY_CLIENTS = "too many clients"
+# Not in the protocol doc; seen on firmware 02.01.00.00 when a client
+# re-registers under an id the printer still holds (the client id is
+# stable across restarts, so a quick reload hits this). The printer is
+# saying it already knows us, so it is treated as success.
+CC2_REG_ALREADY_REGISTERED = "already registered"
 
 # Machine status codes (different from SDCP)
 CC2_STATUS_INITIALIZING = 0
