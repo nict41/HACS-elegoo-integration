@@ -75,17 +75,23 @@ def _cc2_camera(client: MagicMock, *, passive: bool = False) -> ElegooMjpegCamer
 class _StreamResponse:
     """An MJPEG response that streams frames until told to stop."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - keyword-only knobs on a test fake
         self,
         session: "_StreamSession",
         *,
         frames: int | None = None,
         then_stall: bool = False,
         status: int = 200,
+        junk_first: bytes = b"",
+        junk_forever: bytes = b"",
     ) -> None:
         self._session = session
         self._frames = frames
         self._then_stall = then_stall
+        # A half-started camera server: answers 200, then trickles bytes that
+        # never complete a JPEG, so a no-bytes timeout never fires.
+        self._junk_first = junk_first
+        self._junk_forever = junk_forever
         self.status = status
         self.headers = {"Content-Type": "multipart/x-mixed-replace;boundary=b"}
         self.content = MagicMock()
@@ -101,6 +107,11 @@ class _StreamResponse:
                 yield part[:7]
                 yield part[7:]
                 n += 1
+            if self._junk_first:
+                yield self._junk_first
+            while self._junk_forever:
+                await asyncio.sleep(FRAME_INTERVAL)
+                yield self._junk_forever
             if self._then_stall:
                 await asyncio.Event().wait()
 
@@ -798,5 +809,171 @@ class TestFrameParsing:
                 reason = await hub._read_frames(resp)
             assert "no complete JPEG" in reason
             assert hub.frame_count == 0
+
+        _run(run())
+
+
+def _disconnect_reasons(logger: MagicMock) -> list[str]:
+    """Pull the 'why it ended' argument out of every hub disconnect log line."""
+    return [
+        str(c.args[-1])
+        for c in logger.info.call_args_list
+        if c.args and "disconnected from" in str(c.args[0])
+    ]
+
+
+class TestStalledStream:
+    """
+    A camera that answers HTTP 200 but never sends a whole frame.
+
+    Seen on real hardware: the hub logged "connected ... HTTP 200" and then
+    sat for over five minutes with no frame and no timeout, because bytes
+    kept arriving (resetting the no-data timer) while _extract_frames threw
+    them away (so the buffer-size guard never filled either).
+    """
+
+    def test_trickle_without_jpeg_ends_session(self) -> None:
+        """Bytes that never contain a JPEG start marker must not hold the slot."""
+
+        async def run() -> None:
+            cam = _cc2_camera(_make_client())
+            session = _StreamSession(frames=0, junk_forever=b"x" * 64)
+            with (
+                _patch_session(session),
+                patch.object(frame_hub_module, "HUB_FRAME_TIMEOUT", 0.1),
+                patch.object(frame_hub_module, "LOGGER") as logger,
+            ):
+                hub = cam._get_frame_hub()
+                hub.ensure_started()
+                await _until(lambda: _disconnect_reasons(logger))
+                reason = _disconnect_reasons(logger)[0]
+                assert "no complete frame" in reason
+                # Says how much arrived, so silence and a trickle are told apart.
+                assert "bytes" in reason
+                assert session.open == 0
+                await cam._stop_frame_hub("test")
+
+        _run(run())
+
+    def test_unfinished_jpeg_ends_session(self) -> None:
+        """A JPEG start marker followed by bytes that never finish it."""
+
+        async def run() -> None:
+            cam = _cc2_camera(_make_client())
+            session = _StreamSession(
+                frames=0, junk_first=b"\xff\xd8", junk_forever=b"y" * 64
+            )
+            with (
+                _patch_session(session),
+                patch.object(frame_hub_module, "HUB_FRAME_TIMEOUT", 0.1),
+                patch.object(frame_hub_module, "LOGGER") as logger,
+            ):
+                hub = cam._get_frame_hub()
+                hub.ensure_started()
+                await _until(lambda: _disconnect_reasons(logger))
+                assert "no complete frame" in _disconnect_reasons(logger)[0]
+                await cam._stop_frame_hub("test")
+
+        _run(run())
+
+    def test_frame_after_frames_then_trickle_ends_session(self) -> None:
+        """The limit runs between frames too, not only before the first one."""
+
+        async def run() -> None:
+            cam = _cc2_camera(_make_client())
+            session = _StreamSession(frames=3, junk_forever=b"z" * 64)
+            with (
+                _patch_session(session),
+                patch.object(frame_hub_module, "HUB_FRAME_TIMEOUT", 0.1),
+                patch.object(frame_hub_module, "LOGGER") as logger,
+            ):
+                hub = cam._get_frame_hub()
+                hub.ensure_started()
+                await _until(lambda: _disconnect_reasons(logger))
+                assert hub.frame_count == 3
+                assert "no complete frame" in _disconnect_reasons(logger)[0]
+                await cam._stop_frame_hub("test")
+
+        _run(run())
+
+    def test_steady_frames_are_not_cut_off(self) -> None:
+        """Frames arriving faster than the limit keep the session up."""
+
+        async def run() -> None:
+            cam = _cc2_camera(_make_client())
+            session = _StreamSession()  # frames forever, every 2 ms
+            with (
+                _patch_session(session),
+                patch.object(frame_hub_module, "HUB_FRAME_TIMEOUT", 0.1),
+                patch.object(frame_hub_module, "LOGGER") as logger,
+            ):
+                hub = cam._get_frame_hub()
+                hub.ensure_started()
+                await _until(lambda: hub.frame_count > 0)
+                await asyncio.sleep(0.4)  # four times the limit
+                assert _disconnect_reasons(logger) == []
+                assert session.open == 1
+                await cam._stop_frame_hub("test")
+
+        _run(run())
+
+
+class TestViewerWithoutFrames:
+    """A viewer that never receives a frame must not hold the hub open."""
+
+    def test_released_even_if_disconnect_is_never_seen(self) -> None:
+        """
+        No frames, and the transport never reports closing.
+
+        A client that vanishes without a FIN (sleeping laptop, dropped
+        Wi-Fi) is invisible until something is written to it - and with no
+        frames nothing is. Without a cap that subscriber would keep the hub,
+        and so the printer's only camera slot, busy indefinitely.
+        """
+
+        async def run() -> None:
+            cam = _cc2_camera(_make_client())
+            session = _StreamSession()
+            session.error = OSError("refused")
+            request = _FakeRequest()  # never disconnect()ed
+            with (
+                _patch_session(session),
+                _patch_stream_response(),
+                patch.object(camera_module, "CC2_STREAM_WAIT", 0.01),
+                patch.object(camera_module, "CC2_STREAM_NO_FRAME_LIMIT", 0.1),
+            ):
+                task = await _start_viewer(cam, request)
+                await _until(lambda: cam._frame_hub is not None)
+                hub = cam._frame_hub
+                async with asyncio.timeout(3):
+                    await task
+                assert hub.subscribers == 0
+                await cam._stop_frame_hub("test")
+
+        _run(run())
+
+    def test_streaming_viewer_is_not_cut_off(self) -> None:
+        """Frames reset the cap, so a healthy viewer stays connected."""
+
+        async def run() -> None:
+            cam = _cc2_camera(_make_client())
+            session = _StreamSession()
+            request = _FakeRequest()
+            with (
+                _patch_session(session),
+                _patch_stream_response(),
+                patch.object(camera_module, "CC2_STREAM_WAIT", 0.01),
+                patch.object(camera_module, "CC2_STREAM_NO_FRAME_LIMIT", 0.1),
+            ):
+                task = await _start_viewer(cam, request)
+                await _until(lambda: cam._frame_hub is not None)
+                hub = cam._frame_hub
+                await _until(lambda: hub.frame_count > 3)
+                await asyncio.sleep(0.4)
+                assert not task.done()
+                assert hub.subscribers == 1
+                request.disconnect()
+                await task
+                await cam._stop_frame_hub("test")
 
         _run(run())

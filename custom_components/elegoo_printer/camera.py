@@ -73,6 +73,13 @@ FRAME_FETCH_TIMEOUT = 10.0  # how long a snapshot waits for the hub's first fram
 CC2_STREAM_FPS_MIN = 1.0  # per-viewer ?fps= cap, lower clamp
 CC2_STREAM_FPS_MAX = 20.0  # per-viewer ?fps= cap, upper clamp
 CC2_STREAM_WAIT = 1.0  # a viewer re-checks its client this often while no frame comes
+# A viewer that has gone this long without a frame is ended. Without it, a
+# client that vanished without closing the TCP connection (sleeping laptop,
+# dropped Wi-Fi) is never noticed while no frames flow - nothing is written,
+# so nothing fails - and its subscription would keep the hub, and with it
+# the printer's only camera slot, busy indefinitely. The frontend simply
+# reconnects a stream that ends, so a viewer still there loses nothing.
+CC2_STREAM_NO_FRAME_LIMIT = 30.0
 CC2_MJPEG_BOUNDARY = "frame"
 DISABLE_DEBOUNCE_DELAY = 5.0  # keep video on briefly so back-to-back grabs reuse it
 GRAB_FAILURE_LOG_INTERVAL = 300.0  # seconds between repeated grab-failure warnings
@@ -1168,17 +1175,28 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
         response.headers["Content-Type"] = (
             f"multipart/x-mixed-replace;boundary={CC2_MJPEG_BOUNDARY}"
         )
+        loop = asyncio.get_running_loop()
         async with hub.async_subscribe():
             await response.prepare(request)
             last = 0
             frame = hub.fresh_frame()
             if frame is not None:
                 last = hub.frame_count
+            last_frame_sent = loop.time()
             while True:
                 if frame is None:
                     got = await hub.async_next_frame(last, CC2_STREAM_WAIT)
                     if got is None:
                         if self._client_gone(request):
+                            break
+                        if loop.time() - last_frame_sent >= CC2_STREAM_NO_FRAME_LIMIT:
+                            LOGGER.info(
+                                LOG_MARKER + " ending viewer for %s: no frame for "
+                                "%.0fs (hub: %s)",
+                                self.entity_id,
+                                CC2_STREAM_NO_FRAME_LIMIT,
+                                hub.describe(),
+                            )
                             break
                         continue
                     last, frame = got
@@ -1190,6 +1208,7 @@ class ElegooMjpegCamera(ElegooVideoStreamLifecycle, MjpegCamera):
                     await response.write(header + frame + b"\r\n")
                 except ConnectionError:
                     break
+                last_frame_sent = loop.time()
                 frame = None
                 if interval:
                     await asyncio.sleep(interval)
