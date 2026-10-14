@@ -68,6 +68,7 @@ from .const import (
     CC2_MQTT_PORT,
     CC2_MQTT_USERNAME,
     CC2_PRINT_STATUS_TRANSITION_QUEUE_MAX,
+    CC2_REG_ALREADY_REGISTERED,
     CC2_REG_OK,
     CC2_REG_TOO_MANY_CLIENTS,
     CC2_REGISTRATION_TIMEOUT,
@@ -148,6 +149,9 @@ class ElegooCC2Client:
 
         # Auth failure tracking
         self._last_auth_failure: bool = False
+        # The printer's own reason when it accepted the MQTT login but
+        # refused registration. None when registration was not refused.
+        self._registration_rejection: str | None = None
 
         # Delayed disconnect
         self._disconnect_delay_task: asyncio.Task | None = None
@@ -271,6 +275,7 @@ class ElegooCC2Client:
         """
         # Reset auth failure flag for fresh connection attempt
         self._last_auth_failure = False
+        self._registration_rejection = None
 
         if self.is_connected:
             self.logger.debug("Already connected to CC2 printer")
@@ -347,9 +352,26 @@ class ElegooCC2Client:
             if self._last_auth_failure and self.access_code is not None:
                 break
             self._last_auth_failure = False
+            if self._registration_rejection is not None:
+                # The login worked, so another password cannot change the
+                # printer's answer - it would only add another connection
+                # against a printer with a small client cap.
+                await self.disconnect(
+                    reason=f"registration refused: {self._registration_rejection}"
+                )
+                break
             await self.disconnect()
 
         # All attempts failed
+        if self._registration_rejection is not None:
+            self.logger.error(
+                "Failed to connect to CC2 printer %s: the printer accepted the "
+                "login but refused registration with %r. The access code is "
+                "correct; this is the printer's own reason.",
+                self.printer.name,
+                self._registration_rejection,
+            )
+            return False
         self.logger.error(
             "Failed to connect to CC2 printer %s after trying %d password(s). "
             "Please verify the access code in printer settings: "
@@ -418,9 +440,16 @@ class ElegooCC2Client:
             # Register with the printer
             registered = await self._register()
             if not registered:
-                self.logger.debug(
-                    "Registration failed. This usually indicates incorrect access code."
-                )
+                if self._registration_rejection is not None:
+                    self.logger.debug(
+                        "Printer accepted the MQTT login but refused registration: %s",
+                        self._registration_rejection,
+                    )
+                else:
+                    self.logger.debug(
+                        "Registration failed. This usually indicates incorrect "
+                        "access code."
+                    )
                 return False
 
             self._is_registered = True
@@ -602,6 +631,8 @@ class ElegooCC2Client:
         )
         self.logger.debug("Registration payload: %s", json.dumps(payload))
 
+        self._registration_rejection = None
+
         # Create event for registration response
         reg_event = asyncio.Event()
         self._registration_event = reg_event
@@ -638,23 +669,50 @@ class ElegooCC2Client:
 
             # Check registration result
             if self._registration_result:
-                error = self._registration_result.get("error", "")
-                if error == CC2_REG_OK:
-                    self.logger.info("Successfully registered with CC2 printer")
-                    return True
-                if error == CC2_REG_TOO_MANY_CLIENTS:
-                    self.logger.error(
-                        "Too many clients connected to CC2 printer. "
-                        "Close other connections and try again."
-                    )
-                    return False
-                self.logger.error("Registration failed: %s", error)
-                return False
-
+                return self._accept_registration_reply(
+                    str(self._registration_result.get("error", ""))
+                )
             return False
 
         finally:
             self._registration_event = None
+
+    def _accept_registration_reply(self, error: str) -> bool:
+        """
+        Decide whether the printer's registration reply means we are registered.
+
+        Arguments:
+            error: The "error" field of the reply, verbatim.
+
+        Returns:
+            True if this client is registered with the printer.
+
+        """
+        normalized = error.strip().lower()
+        if normalized == CC2_REG_OK:
+            self.logger.info("Successfully registered with CC2 printer")
+            return True
+        if normalized == CC2_REG_ALREADY_REGISTERED:
+            # The stable client id is what makes this possible: the printer
+            # still holds this exact client from a session it has not timed
+            # out yet, so there is nothing to redo.
+            self.logger.info(
+                "Printer still holds our registration from a previous session "
+                "(client_id=%s) - reusing it",
+                self._client_id,
+            )
+            return True
+        # The MQTT login succeeded, so whatever the printer says here is its
+        # reason - keep it for the error the user sees.
+        self._registration_rejection = error or "(empty reason)"
+        if normalized == CC2_REG_TOO_MANY_CLIENTS:
+            self.logger.error(
+                "Too many clients connected to CC2 printer. "
+                "Close other connections and try again."
+            )
+        else:
+            self.logger.error("Registration refused by printer: %s", error)
+        return False
 
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeat messages to keep connection alive."""
