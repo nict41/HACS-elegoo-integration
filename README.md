@@ -7,11 +7,12 @@
 > That is the upstream project, the one you should star, watch and install
 > from. Please send bug reports and feature requests there, not here.
 >
-> This repository is a personal copy of upstream **v2.12.2**, with the full
-> upstream git history preserved, carrying one local change: a fix for
-> Centauri Carbon 2 chamber-camera snapshots. It exists only so that fix can
-> be run before it is available upstream, and it is not intended for general
-> use or redistribution.
+> This repository is a personal copy of upstream **v2.12.2**, maintained by
+> [@nict41](https://github.com/nict41), with the full upstream git history
+> preserved. It carries a small set of local changes, all for the Centauri
+> Carbon 2 (CC2) chamber camera. It exists only so those changes can be run
+> before they are available upstream, and it is not intended for general use
+> or redistribution.
 >
 > Licensed under the MIT License, © 2019–2026 Daniel Cherubini
 > (see [LICENSE](LICENSE)). The upstream `LICENSE` and copyright notice are
@@ -21,19 +22,46 @@
 > |---|---|
 > | Upstream project | <https://github.com/danielcherubini/elegoo-homeassistant> |
 > | Forked at | `v2.12.2` (commit `67b2b59`) |
-> | This version | `2.12.2.1` |
-> | Local change | CC2 chamber-camera snapshot fix ([details](#local-change-cc2-chamber-camera-snapshots)) |
+> | This version | `2.12.3.1` |
+> | Maintained by | [@nict41](https://github.com/nict41) (this copy only) |
+> | Local changes | CC2 chamber camera ([details](#local-changes-cc2-chamber-camera)) |
 >
-> ### Local change: CC2 chamber camera snapshots
+> ### Local changes: CC2 chamber camera
 >
-> `camera.snapshot` on a Centauri Carbon 2 chamber camera always failed. The
-> CC2's camera allows **one** concurrent viewer, so the fix is built around
-> never spending more than one connection at a time and never leaving a
-> connection slot occupied: a single retrying frame grab, an `asyncio.Lock`
-> around enable/grab/disable, a debounced disable, an unconditional
-> slot-releasing disable at startup, and a disable on Home Assistant
-> shutdown. It is scoped to `TransportType.CC2_MQTT`, so SDCP, resin and CC1
-> printers behave exactly as upstream. See `custom_components/elegoo_printer/camera.py`.
+> The CC2 serves its camera as MJPEG on `:8080` and allows exactly **one**
+> concurrent viewer. Its camera server is fragile: two consumers competing
+> for that slot have crashed it, and only a printer restart brought it back.
+> Every change here is scoped to `TransportType.CC2_MQTT`, so SDCP, resin and
+> CC1 printers behave exactly as upstream.
+>
+> - **One connection, however many viewers (2.12.3.0).** A frame hub
+>   (`cc2/frame_hub.py`) holds a single MJPEG connection to the printer and
+>   serves every snapshot and every live viewer from it, including
+>   `/api/camera_proxy` and `/api/camera_proxy_stream`. It starts on demand
+>   and stops after 60 s without viewers or snapshots. It never serves a
+>   frame older than 5 s, and it reconnects with exponential backoff (2 s
+>   doubling to 120 s), sending at most one video enable per step. Live
+>   viewers can cap their frame rate with `?fps=` (1–20). The camera offers
+>   no stream source, so Home Assistant's stream worker and go2rtc cannot
+>   open a second connection.
+> - **Snapshots work.** `camera.snapshot` on a CC2 used to always fail; it
+>   now returns a frame from the camera at `:8080/?action=stream`.
+> - **No leaked video slots.** The disable after use is debounced, an
+>   unconditional slot-releasing disable is sent at startup, and video is
+>   disabled when Home Assistant shuts down.
+> - **Camera passive mode.** An option in the printer's settings reads the
+>   stream without ever sending video enable/disable commands (method 1042).
+> - **Stable MQTT client identity.** The client id is derived from the
+>   printer serial, so restarts and reloads reuse one registration on the
+>   printer instead of adding a new one each time.
+> - **Diagnostics.** Every camera log line carries the `CC2CAM` marker. A
+>   periodic activity summary shows video slot usage, the MQTT session and
+>   the frame hub. A port watchdog records when `:8080` stops or starts
+>   listening.
+>
+> See `custom_components/elegoo_printer/camera.py`,
+> `custom_components/elegoo_printer/cc2/frame_hub.py` and
+> [CHANGELOG.md](CHANGELOG.md).
 
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg)](https://github.com/hacs/integration)
