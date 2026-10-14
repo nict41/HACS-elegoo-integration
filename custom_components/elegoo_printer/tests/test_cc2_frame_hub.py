@@ -254,7 +254,11 @@ class TestSingleConnection:
             request = _FakeRequest()
             with _patch_session(session), _patch_stream_response():
                 task = await _start_viewer(cam, request)
-                await _until(lambda: cam._frame_hub.frame_count >= 5)
+                await _until(
+                    lambda: (
+                        cam._frame_hub is not None and cam._frame_hub.frame_count >= 5
+                    )
+                )
                 request.disconnect()
                 response = await task
                 await cam._stop_frame_hub("test")
@@ -506,9 +510,11 @@ class TestOnDemandLifecycle:
                 client.set_printer_video_stream.assert_called_once_with(enable=False)
                 assert cam._stream_enabled is False
 
+                # The last frame is still fresh, so this snapshot may be
+                # served before the restarted reader connects; wait for it.
                 assert await cam.async_camera_image() is not None
                 assert hub.is_running
-                assert len(session.calls) == 2
+                await _until(lambda: len(session.calls) == 2)
                 assert session.max_open == 1
                 await cam._stop_frame_hub("test")
 
