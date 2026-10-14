@@ -1,7 +1,7 @@
 {
   "domain": "elegoo_printer",
   "name": "Elegoo Printer",
-  "codeowners": ["@danielcherubini"],
+  "codeowners": ["@nict41"],
   "config_flow": true,
   "dependencies": ["ffmpeg"],
   "documentation": "https://github.com/danielcherubini/elegoo-homeassistant",
