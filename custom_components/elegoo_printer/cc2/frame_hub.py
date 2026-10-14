@@ -47,6 +47,12 @@ HUB_WARN_AFTER_FAILURES = 5  # consecutive failures before one WARNING
 HUB_STABLE_SESSION = 30.0  # a session this long resets the backoff
 HUB_CONNECT_TIMEOUT = 10.0  # connect + response headers
 HUB_READ_TIMEOUT = 10.0  # no bytes for this long means the stream has stalled
+# No COMPLETE frame for this long also means it has stalled. Needed on top of
+# HUB_READ_TIMEOUT because a half-started camera server can answer HTTP 200 and
+# then trickle bytes that never form a JPEG: every chunk resets the no-bytes
+# timer, and _extract_frames discards the junk, so the size guard never fills.
+# Applies before the first frame of a session and between frames.
+HUB_FRAME_TIMEOUT = 15.0
 FRAME_FETCH_MAX_BYTES = 4 * 1024 * 1024  # give up on a buffer with no frame in it
 BUFFER_SIZE = 102400  # matches homeassistant.components.mjpeg.camera
 
@@ -463,35 +469,69 @@ class CC2FrameHub:
             return f"{type(err).__name__}: {err}"
 
     async def _read_frames(self, resp: aiohttp.ClientResponse) -> str:
-        """Split the byte stream on SOI/EOI markers, like the old single-frame grab."""
+        """
+        Split the byte stream on SOI/EOI markers, like the old single-frame grab.
+
+        Two independent stall limits end the session: no bytes at all for
+        HUB_READ_TIMEOUT, and no complete frame for HUB_FRAME_TIMEOUT. The
+        second is what catches a server that keeps talking without ever
+        sending a picture.
+        """
         chunks = resp.content.iter_chunked(BUFFER_SIZE)
         buf = bytearray()
+        last_frame_at = self._now()
+        bytes_since_frame = 0
         while True:
+            frame_deadline = last_frame_at + HUB_FRAME_TIMEOUT
+            wait = min(HUB_READ_TIMEOUT, frame_deadline - self._now())
+            if wait <= 0:
+                return self._no_frame_reason(bytes_since_frame)
             try:
-                async with asyncio.timeout(HUB_READ_TIMEOUT):
+                async with asyncio.timeout(wait):
                     chunk = await anext(chunks)
             except StopAsyncIteration:
                 return "printer closed the stream"
             except TimeoutError:
+                if self._now() >= frame_deadline:
+                    return self._no_frame_reason(bytes_since_frame)
                 return f"no data for {HUB_READ_TIMEOUT:.0f}s"
             buf += chunk
-            await self._extract_frames(buf)
+            bytes_since_frame += len(chunk)
+            if await self._extract_frames(buf):
+                last_frame_at = self._now()
+                bytes_since_frame = 0
             if len(buf) > FRAME_FETCH_MAX_BYTES:
                 return f"no complete JPEG in {len(buf)} bytes"
 
-    async def _extract_frames(self, buf: bytearray) -> None:
-        """Publish every complete JPEG in `buf` and drop the consumed bytes."""
+    @staticmethod
+    def _no_frame_reason(bytes_since_frame: int) -> str:
+        # The byte count tells silence (0) apart from a trickle of non-JPEG data.
+        return (
+            f"no complete frame for {HUB_FRAME_TIMEOUT:.0f}s "
+            f"({bytes_since_frame} bytes received without one)"
+        )
+
+    async def _extract_frames(self, buf: bytearray) -> int:
+        """
+        Publish every complete JPEG in `buf` and drop the consumed bytes.
+
+        Returns:
+            How many frames were published.
+
+        """
+        published = 0
         while True:
             start = buf.find(JPEG_SOI)
             if start == -1:
                 # Keep the last byte: it may be the 0xff of a split marker.
                 del buf[:-1]
-                return
+                return published
             end = buf.find(JPEG_EOI, start + 2)
             if end == -1:
                 del buf[:start]
-                return
+                return published
             await self._publish(bytes(buf[start : end + 2]))
+            published += 1
             del buf[: end + 2]
 
     async def _publish(self, frame: bytes) -> None:
