@@ -115,6 +115,21 @@ class CC2StatusMapper:
         CC2_SUBSTATUS_AUTO_LEVELING_COMPLETED: ElegooPrintStatus.LEVELING,
     }
 
+    # Sub-states that only describe a print when one is running. Homing or
+    # leveling on its own (from the screen, or a home command over the API)
+    # leaves the same sub-status behind after the machine returns to idle,
+    # and the printer keeps reporting it until something else replaces it.
+    # Mapped regardless, an idle printer shows as printing indefinitely, which
+    # blocks every automation that waits for the printer to be idle.
+    IN_PRINT_SUBSTATUSES: ClassVar[frozenset[int]] = frozenset(
+        {
+            CC2_SUBSTATUS_HOMING,
+            CC2_SUBSTATUS_HOMING_COMPLETED,
+            CC2_SUBSTATUS_AUTO_LEVELING,
+            CC2_SUBSTATUS_AUTO_LEVELING_COMPLETED,
+        }
+    )
+
     @classmethod
     def map_status(
         cls,
@@ -221,7 +236,15 @@ class CC2StatusMapper:
         # Map sub-status to print status from nested structure
         machine_status = cc2_data.get("machine_status", {})
         sub_status = machine_status.get("sub_status", 0)
-        print_info.status = cls.PRINT_STATUS_MAP.get(sub_status, ElegooPrintStatus.IDLE)
+        if (
+            sub_status in cls.IN_PRINT_SUBSTATUSES
+            and machine_status.get("status", CC2_STATUS_IDLE) != CC2_STATUS_PRINTING
+        ):
+            print_info.status = ElegooPrintStatus.IDLE
+        else:
+            print_info.status = cls.PRINT_STATUS_MAP.get(
+                sub_status, ElegooPrintStatus.IDLE
+            )
 
         # Map print data from print_status (real CC2 structure)
         print_status = cc2_data.get("print_status", {})

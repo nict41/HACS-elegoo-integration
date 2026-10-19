@@ -18,6 +18,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- CC2 print status no longer shows `printing` on an idle printer after homing or leveling outside a print. The printer keeps reporting the last homing/leveling sub-status once it returns to idle, and those sub-states were mapped to `printing`/`leveling` regardless of the machine status, so the sensor stayed stuck until the next real print and blocked automations waiting for idle (auto power-off). They now only count while the machine status is printing.
 - CC2 chamber camera: the printer now only ever sees one camera connection. A new frame hub holds a single MJPEG connection and serves every snapshot and every live viewer from it, instead of each consumer opening its own. A live view running next to a snapshot poll had crashed the printer's camera server, which only a printer restart recovered. The hub starts on demand, stops after 60 s without viewers or snapshots, never serves a frame older than 5 s, and reconnects with exponential backoff (2 s doubling to 120 s, one video enable per step). Live viewers can cap their frame rate with `?fps=` (1-20). The CC2 camera no longer offers a stream source, so Home Assistant's stream worker and go2rtc cannot open a second connection.
 - WebSocket discovery now recognizes hostnames by their resolved IPv4 address, and options updates validate the newly submitted address.
 - CC1 print status no longer sticks on a stale state for the remainder of a job when the printer holds an unmapped milestone code.
