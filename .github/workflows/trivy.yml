@@ -1,0 +1,66 @@
+name: Trivy
+
+# Weekly scan of the repository files for vulnerable dependencies and
+# committed secrets. On a public repository the findings appear under
+# Security > Code scanning. The job fails, and GitHub emails about the
+# failed scheduled run, when it finds a HIGH or CRITICAL vulnerability
+# that has a fix, or a secret.
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+  # Lets a change to this file prove itself before it merges.
+  pull_request:
+    paths:
+      - .github/workflows/trivy.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The scanner runs from its published image, pinned by digest, rather than
+  # through a third-party action whose tag could be moved.
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+jobs:
+  repo:
+    name: Scan repository files
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for vulnerable dependencies and committed secrets
+        run: |
+          trivy() {
+            docker run --rm -v "${PWD}:/src" -w /src -v trivy-cache:/root/.cache \
+              "${TRIVY_IMAGE}" "$@"
+          }
+          trivy fs --scanners vuln,secret --severity HIGH,CRITICAL \
+            --ignore-unfixed --format sarif --output trivy-repo.sarif .
+          {
+            echo '## Repository scan'
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          set +e
+          trivy fs --scanners vuln,secret --severity HIGH,CRITICAL \
+            --ignore-unfixed --skip-db-update --exit-code 1 --format table . \
+            | tee -a "${GITHUB_STEP_SUMMARY}"
+          status=${PIPESTATUS[0]}
+          set -e
+          echo '```' >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+
+      - name: Upload findings to code scanning
+        if: always() && !github.event.repository.private
+        uses: github/codeql-action/upload-sarif@5895b2c9be147bc7f1c75ce72c5cb577febb1907 # v4
+        with:
+          sarif_file: trivy-repo.sarif
+          category: trivy-repo
