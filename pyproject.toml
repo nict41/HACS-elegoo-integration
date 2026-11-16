@@ -1,12 +1,12 @@
 [project]
 name = "elegoo_printer"
 version = "2.12.3.4"
-requires-python = ">=3.13"
+requires-python = ">=3.14.2"
 description = "Home Assistant Addon for Elegoo Printers"
 dependencies = [
     "aiomqtt>=2.4.0",
     "colorlog>=6.9.0",
-    "homeassistant==2025.4.0",
+    "homeassistant==2026.11.1",
     "loguru>=0.7.3",
     "websocket-client>=1.8.0",
     "websockets>=15.0.1",
@@ -15,9 +15,13 @@ dependencies = [
 [dependency-groups]
 dev = [
     "amqtt>=0.11.3",
+    "av==19.0.0",
+    "ha-ffmpeg==3.2.2",
+    "numpy==2.3.2",
     "paho-mqtt>=2.1.0",
     "pre-commit>=4.5.1",
     "pytest>=8.4.1",
+    "pyturbojpeg==1.8.3",
     "ruff>=0.9.10",
     "ty>=0.0.1a21",
 ]
