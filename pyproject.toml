@@ -15,7 +15,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "amqtt>=0.11.3",
-    "av==19.0.0",
+    "av==19.0.2",
     "ha-ffmpeg==3.2.2",
     "numpy==2.3.2",
     "paho-mqtt>=2.1.0",
